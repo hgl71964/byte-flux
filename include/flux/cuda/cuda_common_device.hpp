@@ -23,17 +23,22 @@
 #include <cstddef>
 #include <cstring>
 
-#if defined(CUDA_VERSION) && CUDA_VERSION > 12080
-#include <cuda/atomic>
-#else
-#include <cuda/std/atomic>
-#endif
+
 #include <cuda/std/chrono>
 
+#include <cuda/atomic>
 template <typename T = int>
 using atomic_ref_sys = cuda::atomic_ref<T, cuda::thread_scope_system>;
 template <typename T = int>
 using atomic_ref_dev = cuda::atomic_ref<T, cuda::thread_scope_device>;
+
+
+
+
+
+
+
+
 
 namespace bytedance::flux {
 __device__ __inline__ uint64_t

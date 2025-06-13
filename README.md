@@ -66,9 +66,19 @@ Here is a snippet to install Flux in a virtual environment. Let's finish the ins
 ```bash
 conda create -n flux python=3.11
 conda activate flux
-pip3 install packaging
-pip3 install ninja
+pip3 install packaging ninja cmake wheel
 pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+chmod +x install_deps.sh
+./install_deps.sh
+
+sudo apt install mpich
+sudo apt install libibverbs-dev
+sudo apt install libnuma-dev
+
+# then just include the cuda/atomic
+
+export PYTHONPATH=$(pwd)/python
 
 ./build.sh --clean-all
 ./build.sh --arch "80;89;90" --nvshmem --package
