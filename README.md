@@ -50,7 +50,7 @@ Install Flux either from source or from PyPI.
 Here is a snippet to install Flux in a virtual environment. Let's finish the installation in an virtual environment with CUDA 12.4, torch 2.6.0 and python 3.11.
 
 ```bash
-docker run -it   --gpus all   --network=host    pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+docker run -it   --gpus all   --network=host    nvcr.io/nvidia/pytorch:24.07-py3
 
 rm -rf 3rdparty/cutlass/* 3rdparty/nccl/*
 
