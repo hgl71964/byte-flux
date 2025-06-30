@@ -45,43 +45,35 @@ Flux's efficient kernels are compatible with Pytorch and can be integrated into 
 ## Getting started
 Install Flux either from source or from PyPI.
 
-### Install from Source
-```bash
-git clone --recursive https://github.com/bytedance/flux.git && cd flux
-
-# Install dependencies
-bash ./install_deps.sh
-
-# For Ampere(sm80) GPU
-./build.sh --arch 80 --nvshmem
-# For Ada Lovelace(sm89) GPU
-./build.sh --arch 89 --nvshmem
-# For Hopper(sm90) GPU
-./build.sh --arch 90 --nvshmem
-```
 
 #### Install in a virtual environment
 Here is a snippet to install Flux in a virtual environment. Let's finish the installation in an virtual environment with CUDA 12.4, torch 2.6.0 and python 3.11.
 
 ```bash
-conda create -n flux python=3.11
-conda activate flux
+docker run -it   --gpus all   --network=host    pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel
+
+rm -rf 3rdparty/cutlass/* 3rdparty/nccl/*
+
+apt update && apt install git wget mpich libibverbs-dev libnuma-dev
+
+git submodule update --init
+
+
 pip3 install packaging ninja cmake wheel
-pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# pip3 install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
 
 chmod +x install_deps.sh
 ./install_deps.sh
 
-sudo apt install mpich
-sudo apt install libibverbs-dev
-sudo apt install libnuma-dev
 
 # then just include the cuda/atomic
 
 export PYTHONPATH=$(pwd)/python
 
 ./build.sh --clean-all
-./build.sh --arch "80;89;90" --nvshmem --package
+# ./build.sh --arch "80;89;90" --nvshmem --package
+./build.sh --arch "90" --nvshmem --package
 ```
 
 Then you would expect a wheel package under `dist/` folder that is suitable for your virtual environment.
