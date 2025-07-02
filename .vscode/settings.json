@@ -1,7 +1,8 @@
 {
     "python.analysis.extraPaths": [
-        "/root/repos/cohere-dev/vllm-cohere",
-        "/root/repos/cohere-dev/venv/lib/python3.12/site-packages/torch",
+        "/root/repos/vllm-cohere-flux",
+        "/root/repos/pytorch",
+        "/root/repos/triton/python",
         "python"
     ]
 }
