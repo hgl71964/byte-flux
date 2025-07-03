@@ -402,6 +402,19 @@ if __name__ == "__main__":
         "ring1d": flux.RingMode.Ring1D,
         "ring2d": flux.RingMode.Ring2D,
     }.get(args.ring_mode, None)
+
+    if TP_GROUP.rank() == 0:
+        print('*'*20)
+        print(f'{TP_GROUP}, {NNODES}')
+        print(data_config)
+        print(input.shape, weight.shape)
+        print(bias, input_scale, weight_scale)
+        print(args.transpose_weight, args.fuse_reduction, args.ring_reduction, args.use_gemmk)
+        print(reduce_scatter_option)
+        print('*'*20)
+    TP_GROUP.barrier()
+
+
     with flux.util.group_profile(
         name="gemm_rs_" + os.environ["TORCHELASTIC_RUN_ID"], do_prof=args.profile, group=TP_GROUP
     ):

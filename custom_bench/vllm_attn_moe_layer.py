@@ -1,5 +1,9 @@
+# NVSHMEM_DISABLE_CUDA_VMM=1 torchrun --nproc_per_node=4 custom_bench/vllm_attn_moe_layer.py --tp_size 4
+
 import os
 from typing import Optional, Callable, Tuple, List
+import numpy as np
+import random
 
 import argparse
 import torch
@@ -21,7 +25,7 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce,
-
+                            get_tp_group,
                             init_world_group,
                               )
 from vllm.distributed import (ensure_model_parallel_initialized,
@@ -30,16 +34,27 @@ from vllm.distributed import (ensure_model_parallel_initialized,
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 from vllm.model_executor.layers.linear import RowParallelLinear
 
-# torchrun --nproc_per_node=2 custom_bench/vllm_moe_layer.py
+import flux
+from flux.cpp_mod import ReduceScatterOption
+
+
 def print_rank0(*args):
     if dist.get_rank() == 0:
         print(*args)
+
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
+    "s8": torch.int8,
+    "s32": torch.int32,
+}
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=2048)
-
 
     parser.add_argument("--num_experts", type=int, default=128)
     parser.add_argument("--num_experts_per_tok", type=int, default=8,help='topK')
@@ -51,20 +66,79 @@ def parse_args():
 
     parser.add_argument("--tp_size", type=int, default=2)
     parser.add_argument("--ep_size", type=int, default=1)
-    parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument("--dtype", default="bfloat16", type=str, choices=list(DTYPE_MAP.keys()))
 
+    rs = parser.add_argument_group('RS')
+    rs.add_argument(
+        "--transpose_weight", default=False, action="store_true", help="whether to transpose weight"
+    )
+    rs.add_argument(
+        "--fuse_reduction", default=False, action="store_true", help="fuse reduction to gemm"
+    )
+    rs.add_argument(
+        "--ring_reduction",
+        default=False,
+        action="store_true",
+        help="reduce paritial output with ring order",
+    )
+    rs.add_argument("--has_bias", default=False, action="store_true", help="whether have bias")
+    rs.add_argument(
+        "--debug", action="store_true", help="debug mode. use human read input", default=False
+    )
+    rs.add_argument(
+        "--use_1d_ring",
+        action=argparse.BooleanOptionalAction,
+        help="use 1d ring for reduction",
+    )
+    rs.add_argument(
+        "--use_p2p_read",
+        action=argparse.BooleanOptionalAction,
+        help="use 1d ring for reduction",
+    )
+    rs.add_argument(
+        "--use_cudaMemcpyAsync",
+        action=argparse.BooleanOptionalAction,
+        help="use 1d ring for reduction",
+    )
+    rs.add_argument(
+        "--use_gemmk",
+        action=argparse.BooleanOptionalAction,
+        help="use 1d ring for reduction",
+    )
+    rs.add_argument(
+        "--per_tile_flags",
+        action=argparse.BooleanOptionalAction,
+        help="use 1d ring for reduction",
+    )
+    rs.add_argument(
+        "--reduce_scatter_blocks",
+        type=int,
+        help="number of blocks for reduce scatter",
+    )
+    rs.add_argument(
+        "--ring_mode",
+        choices=["ring1d", "ring2d"],
+        help="ring mode. auto for auto detect",
+    )
     args = parser.parse_args()
     return args
 
-def get_dtype(args):
-    if args.dtype == "bfloat16":
-        return torch.bfloat16
-    elif args.dtype == "float16":
-        return torch.float16
-    elif args.dtype == "float32":
-        return torch.float32
-    else:
-        raise ValueError(f"Unsupported dtype: {args.dtype}")
+def init_seed(seed=0):
+    os.environ["NCCL_DEBUG"] = os.getenv("NCCL_DEBUG", "ERROR")
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.set_printoptions(precision=2)
+    torch.manual_seed(3 + seed)
+    torch.cuda.manual_seed_all(3 + seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    np.random.seed(3 + seed)
+    random.seed(3 + seed)
+
+
 
 @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
 def token_choice_with_bias(hidden_states: torch.Tensor,
@@ -340,7 +414,7 @@ def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
     # Initialize the process group
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     device = torch.device(f'cuda:{local_rank}')
     torch.cuda.set_device(local_rank)
 
@@ -419,8 +493,34 @@ def gen(seq_lens, num_heads, num_blocks, block_size, head_size,
             out, cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, window_size,
             block_tables, soft_cap, fa_version, q_descale, k_descale, v_descale)
 
+def test_allclose(tensor1, tensor2, threshold_map=None):
+    if threshold_map is None:
+        threshold_map = {
+            torch.float16: 1e-2,
+            torch.bfloat16: 2e-2,
+            torch.float8_e4m3fn: 3e-2,
+            torch.float8_e5m2: 3e-2,
+            torch.int8: 2e-1,
+        }
+    
+    # Ensure tensors have same dtype
+    if tensor1.dtype != tensor2.dtype:
+        raise ValueError(f"Tensor dtypes don't match: {tensor1.dtype} vs {tensor2.dtype}")
+    
+    # Get threshold for dtype, default to 1e-5 if not found
+    threshold = threshold_map.get(tensor1.dtype, 1e-5)
+    
+    # Use threshold for both atol and rtol
+    return torch.allclose(tensor1, tensor2, atol=threshold, rtol=threshold)
 
-def vllm_forward(o_proj, vllm_moe_layer, 
+def test_tensors(ref_out, test_out, name, results):
+    if ref_out is not None and test_out is not None:
+        results[name] = test_allclose(
+            ref_out, test_out,
+        )
+
+def vllm_forward(args,
+                o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
                 cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
@@ -439,22 +539,36 @@ def vllm_forward(o_proj, vllm_moe_layer,
         block_table=block_tables,
         softcap=soft_cap,
         fa_version=fa_version,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
     )
     attn_out = out.view(-1, hidden_size_per_tp)
     print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
     # print_rank0(f'parllel? {o_proj.input_is_parallel}, in {o_proj.input_size_per_partition}, out {o_proj.output_size_per_partition}, reduce {o_proj.reduce_results}')
 
-    proj_out, _ = o_proj(attn_out)  # NOTE: applied all-reduce
+    proj_out, _ = o_proj(attn_out)  # applied all-reduce
     print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
 
     vllm_out = vllm_moe_layer(proj_out, router_logits)
     print_rank0(f'vllm_out: {vllm_out.shape}')
     return attn_out, proj_out, vllm_out
 
-def overlap_forward(o_proj, vllm_moe_layer, 
+
+def prepare_rs(args):
+    reduce_scatter_option = ReduceScatterOption()
+    reduce_scatter_option.use_1d_ring = args.use_1d_ring
+    reduce_scatter_option.use_p2p_read = args.use_p2p_read
+    reduce_scatter_option.use_cudaMemcpyAsync = args.use_cudaMemcpyAsync
+    reduce_scatter_option.use_gemmk = args.use_gemmk
+    reduce_scatter_option.per_tile_flags = args.per_tile_flags
+    reduce_scatter_option.num_blocks = args.reduce_scatter_blocks
+    reduce_scatter_option.ring_mode = {
+        "ring1d": flux.RingMode.Ring1D,
+        "ring2d": flux.RingMode.Ring2D,
+    }.get(args.ring_mode, None)
+    return reduce_scatter_option
+
+def flux_forward(args,
+                o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
                 cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
@@ -473,18 +587,50 @@ def overlap_forward(o_proj, vllm_moe_layer,
         block_table=block_tables,
         softcap=soft_cap,
         fa_version=fa_version,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
     )
     attn_out = out.view(-1, hidden_size_per_tp)
-    print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
 
     # reduce-scatter + GEMM
+    reduce_scatter_option = prepare_rs(args)
+    tp_process_group = get_tp_group().device_group
+    M = attn_out.size(0) # in 
+    N = args.hidden_size # out
+    is_fp8 = flux.util.is_fp8_dtype(attn_out.dtype)
+    is_s8_dequant = attn_out.dtype == torch.int8
+    output_dtype = torch.bfloat16 if is_fp8 or is_s8_dequant else attn_out.dtype
 
-    # all-gather + MoE
+    print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
+    dist.barrier()
 
-    return attn_out
+    gemm_rs_op = flux.GemmRS(
+        tp_process_group,
+        1,  # NNODE
+        (M + 1024 - 1) // 1024 * 1024,
+        N,
+        attn_out.dtype,
+        output_dtype,
+        transpose_weight=args.transpose_weight,
+        fuse_reduction=args.fuse_reduction,
+        ring_reduction=args.ring_reduction,
+    )
+    output = gemm_rs_op.forward(
+        attn_out,
+        o_proj.weight,
+        bias=None,
+        input_scale=None,
+        weight_scale=None,
+        output_scale=None,
+        fast_accum=False,
+        reduce_scatter_option=reduce_scatter_option,
+    )
+    print_rank0(f'gemm RS out: {output.shape}')
+
+    # all-gather 
+
+    # FusedMoE_
+
+    return attn_out, None, None
 
 def main():
     args = parse_args()
@@ -504,10 +650,24 @@ def main():
         args.tp_size,
         1,  # args.pp_size,
     )
+
+    # FLUX
+    init_seed(rank)
+    print_rank0("[flux_shm] before initialization")
+    tp_group = get_tp_group()
+    flux.init_flux_shm(tp_group.device_group)
+    torch.cuda.synchronize()
+    print_rank0("[flux_shm] after initialization")
+
+    # from flux.testing import initialize_distributed
+    # TP_GROUP = initialize_distributed()
+    # RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
+
+    print(f'rank: {rank} init OK!')
     dist.barrier()
 
     # data
-    dtype = get_dtype(args)
+    dtype = DTYPE_MAP[args.dtype]
     M = args.batch_size * args.seq_len
     router_logits = torch.randn(M, args.num_experts, device=device, dtype=dtype)
     seq_lens = [(args.seq_len, args.seq_len) for _ in range(args.batch_size)]
@@ -541,8 +701,7 @@ def main():
                             quant_config=None,  # TODO
                             tp_size=args.tp_size,
                             prefix=f"experts",
-                            custom_routing_function=token_choice_with_bias)
-    vllm_moe_layer.to(device)
+                            custom_routing_function=token_choice_with_bias).to(device)
 
     o_proj = RowParallelLinear(
         args.hidden_size,  # in NOTE: this will be sharded by tp
@@ -553,14 +712,32 @@ def main():
     ).to(device)
     dist.barrier()
 
+
     # forward
-    vllm_out = vllm_forward(o_proj, vllm_moe_layer,
+    vllm_outs = vllm_forward(args,
+                o_proj, vllm_moe_layer,
+                hidden_size_per_tp, router_logits,
+                q, k, v, out, 
+                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
+                window_size, block_tables, soft_cap, fa_version,
+                q_descale, k_descale, v_descale,
+            )
+    flux_outs = flux_forward(args,
+                 o_proj, vllm_moe_layer,
                  hidden_size_per_tp, router_logits,
                  q, k, v, out, 
                  cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
                  window_size, block_tables, soft_cap, fa_version,
                  q_descale, k_descale, v_descale,
                 )
+    names = ['attn_out', 'proj_out', 'moe_out']
+
+    results = {}
+    for name, vllm_out, flux_out in zip(names, vllm_outs, flux_outs):
+        test_tensors(vllm_out, flux_out, name, results)
+    for output_name, is_close in results.items():
+        status = "✅ PASS" if is_close else "❌ FAIL"
+        print(f"  {output_name}: {status}")
 
     # bench
     # quantiles = [0.5, 0.2, 0.8]
