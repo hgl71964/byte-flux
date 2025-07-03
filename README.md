@@ -71,6 +71,7 @@ chmod +x install_deps.sh
 # then just include the cuda/atomic
 
 export PYTHONPATH=$(pwd)/python
+# export PYTHONPATH=/workspace/byte-flux/python:/workspace/vllm-cohere-flux/
 
 ./build.sh --clean-all
 # ./build.sh --arch "80;89;90" --nvshmem --package
