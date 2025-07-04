@@ -252,8 +252,9 @@ def main():
     dist.barrier()
 
     r = {}
-
     partial_out = torch.randn(2048, 4096, device=device, dtype=dtype)
+
+    # AR - RS+AG
     ar_out = tensor_model_parallel_all_reduce(partial_out)
 
     rs_out = tensor_model_parallel_reduce_scatter(partial_out,0)
@@ -262,11 +263,10 @@ def main():
     test_tensors(ar_out, ag_out, 'out', r)
 
 
-    # Path 1: AllReduce with FP32 accumulation
+    # higher precision
     ar_out_fp32 = tensor_model_parallel_all_reduce(partial_out.float())
     ar_out_accurate = ar_out_fp32.bfloat16()
 
-    # Path 2: ReduceScatter + AllGather with FP32 accumulation
     rs_out_fp32 = tensor_model_parallel_reduce_scatter(partial_out.float(), 0)
     ag_out_fp32 = tensor_model_parallel_all_gather(rs_out_fp32, 0)
     ag_out_accurate = ag_out_fp32.bfloat16()
@@ -292,9 +292,6 @@ def main():
                            f"MAX_DIFF: {result['max_diff']:.2e}, "
                            f"unmatched: {result['unmatched_count']}/{result['total_elements']} "
                            f"({unmatched_pct:.2f}%))")
-    dist.barrier()
-
-
     dist.destroy_process_group()
 
 if __name__ == "__main__":
