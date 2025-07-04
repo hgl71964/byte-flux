@@ -2,6 +2,7 @@
 
 import os
 from typing import Optional, Callable, Tuple, List
+from copy import deepcopy
 import numpy as np
 import random
 
@@ -25,6 +26,8 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce,
+                              tensor_model_parallel_all_gather,
+                              tensor_model_parallel_reduce_scatter,
                             get_tp_group,
                             init_world_group,
                               )
@@ -510,8 +513,31 @@ def test_allclose(tensor1, tensor2, threshold_map=None):
     # Get threshold for dtype, default to 1e-5 if not found
     threshold = threshold_map.get(tensor1.dtype, 1e-5)
     
-    # Use threshold for both atol and rtol
-    return torch.allclose(tensor1, tensor2, atol=threshold, rtol=threshold)
+    # Check if tensors are close
+    is_close = torch.allclose(tensor1, tensor2, atol=threshold, rtol=threshold)
+    
+    # Calculate absolute difference between tensors
+    abs_diff = torch.abs(tensor1 - tensor2)
+    max_diff = abs_diff.max().item()
+    
+    # Calculate number of unmatched elements
+    if not is_close:
+        # Create boolean mask for elements that are NOT close
+        close_mask = torch.isclose(tensor1, tensor2, atol=threshold, rtol=threshold)
+        unmatched_count = (~close_mask).sum().item()
+        total_elements = tensor1.numel()
+    else:
+        unmatched_count = 0
+        total_elements = tensor1.numel()
+    
+    return {
+        'is_close': is_close,
+        'unmatched_count': unmatched_count,
+        'total_elements': total_elements,
+        'dtype': tensor1.dtype,
+        'threshold': threshold,
+        'max_diff': max_diff,
+    }
 
 def test_tensors(ref_out, test_out, name, results):
     if ref_out is not None and test_out is not None:
@@ -519,6 +545,7 @@ def test_tensors(ref_out, test_out, name, results):
             ref_out, test_out,
         )
 
+@torch.no_grad()
 def vllm_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
@@ -547,10 +574,56 @@ def vllm_forward(args,
 
     proj_out, _ = o_proj(attn_out)  # applied all-reduce
     print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
+    # print_rank0(f'{o_proj.weight}, {attn_out}, {proj_out}')
 
-    vllm_out = vllm_moe_layer(proj_out, router_logits)
-    print_rank0(f'vllm_out: {vllm_out.shape}')
-    return attn_out, proj_out, vllm_out
+    # TODO vllm_moe_layer will modify in place
+    # vllm_out = vllm_moe_layer(proj_out, router_logits)
+    # print_rank0(f'vllm_out: {vllm_out.shape}')
+    return attn_out, proj_out, None
+
+@torch.no_grad()
+def breakdown_forward(args,
+                o_proj, vllm_moe_layer,
+                hidden_size_per_tp, router_logits,
+                q, k, v, out, 
+                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
+                window_size, block_tables, soft_cap, fa_version, 
+                q_descale, k_descale, v_descale,
+            ):
+    flash_attn_varlen_func(
+        q=q, k=k, v=v, out=out,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap,
+        fa_version=fa_version,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+    )
+    attn_out = out.view(-1, hidden_size_per_tp)
+    print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
+    # print_rank0(f'parllel? {o_proj.input_is_parallel}, in {o_proj.input_size_per_partition}, out {o_proj.output_size_per_partition}, reduce {o_proj.reduce_results}')
+
+    assert o_proj.bias is None
+
+    partial_out = torch.nn.functional.linear(attn_out, o_proj.weight)
+
+    ## all-reduce
+    proj_out = tensor_model_parallel_all_reduce(partial_out)
+    print_rank0(f'partial_out: {partial_out.shape}, proj_out: {proj_out.shape}, reduce: {o_proj.reduce_results}, tp_size: {o_proj.tp_size}, weights: {o_proj.weight.shape}, bias: {o_proj.bias}')
+
+    ## RS+AG
+    # reduced_scattered_out = tensor_model_parallel_reduce_scatter(partial_out,0)
+    # proj_out = tensor_model_parallel_all_gather(reduced_scattered_out,0)
+    # print_rank0(f'partial_out: {partial_out.shape}, reduced_scattered_out: {reduced_scattered_out.shape}, proj_out: {proj_out.shape},')
+
+    # vllm_out = vllm_moe_layer(proj_out, router_logits)
+    # print_rank0(f'vllm_out: {vllm_out.shape}')
+    return attn_out, proj_out, None
 
 
 def prepare_rs(args):
@@ -567,6 +640,7 @@ def prepare_rs(args):
     }.get(args.ring_mode, None)
     return reduce_scatter_option
 
+@torch.no_grad()
 def flux_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
@@ -689,6 +763,38 @@ def main():
                 tp_size=args.tp_size,
             )
     # torch.distributed.breakpoint(0)
+
+    dist.barrier()
+    partial_out = torch.randn(2048, 4096, device=device, dtype=dtype)
+    ar_out = tensor_model_parallel_all_reduce(partial_out)
+    reduced_scattered_out = tensor_model_parallel_reduce_scatter(partial_out,0)
+    ag_out = tensor_model_parallel_all_gather(reduced_scattered_out,0)
+    print_rank0(f'ar_out: {ar_out.shape}, ag_out: {ag_out.shape}')
+
+    r = {}
+    test_tensors(ar_out, ag_out, 'out', r)
+    for output_name, result in r.items():
+        if 'error' in result:
+            print_rank0(f"  {output_name}: ❌ FAIL - {result['error']}")
+        else:
+            status = "✅ PASS" if result['is_close'] else "❌ FAIL"
+            dtype_str = str(result['dtype']).replace('torch.', '') if result['dtype'] else 'Unknown'
+            
+            if result['is_close']:
+                print_rank0(f"  {output_name}: {status} "
+                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
+                           f"MAX_DIFF: {result['max_diff']:.2e}"
+                )
+            else:
+                unmatched_pct = (result['unmatched_count'] / result['total_elements']) * 100
+                print_rank0(f"  {output_name}: {status} "
+                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
+                           f"MAX_DIFF: {result['max_diff']:.2e}, "
+                           f"unmatched: {result['unmatched_count']}/{result['total_elements']} "
+                           f"({unmatched_pct:.2f}%))")
+    dist.barrier()
+
+
     
     # model
     vllm_moe_layer = FusedMoE_(num_experts=args.num_experts,
@@ -710,6 +816,8 @@ def main():
         params_dtype=dtype,
         quant_config=None, # quant_config=quant_config,
     ).to(device)
+    with torch.no_grad():
+        o_proj.weight.data.uniform_(0, 1)
     dist.barrier()
 
 
@@ -722,22 +830,59 @@ def main():
                 window_size, block_tables, soft_cap, fa_version,
                 q_descale, k_descale, v_descale,
             )
-    flux_outs = flux_forward(args,
-                 o_proj, vllm_moe_layer,
-                 hidden_size_per_tp, router_logits,
-                 q, k, v, out, 
-                 cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                 window_size, block_tables, soft_cap, fa_version,
-                 q_descale, k_descale, v_descale,
-                )
+    breakdown_outs = breakdown_forward(args,
+                o_proj, vllm_moe_layer,
+                hidden_size_per_tp, router_logits,
+                q, k, v, torch.empty_like(out), 
+                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
+                window_size, block_tables, soft_cap, fa_version,
+                q_descale, k_descale, v_descale,
+            )
     names = ['attn_out', 'proj_out', 'moe_out']
-
     results = {}
-    for name, vllm_out, flux_out in zip(names, vllm_outs, flux_outs):
-        test_tensors(vllm_out, flux_out, name, results)
-    for output_name, is_close in results.items():
-        status = "✅ PASS" if is_close else "❌ FAIL"
-        print(f"  {output_name}: {status}")
+    for name, vllm_out, break_out in zip(names, vllm_outs, breakdown_outs):
+        test_tensors(vllm_out, break_out, name, results)
+
+        # if name == 'proj_out':
+        #     print_rank0(vllm_out)
+        #     print_rank0(break_out)
+
+    for output_name, result in results.items():
+        if 'error' in result:
+            print_rank0(f"  {output_name}: ❌ FAIL - {result['error']}")
+        else:
+            status = "✅ PASS" if result['is_close'] else "❌ FAIL"
+            dtype_str = str(result['dtype']).replace('torch.', '') if result['dtype'] else 'Unknown'
+            
+            if result['is_close']:
+                print_rank0(f"  {output_name}: {status} "
+                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
+                           f"MAX_DIFF: {result['max_diff']:.2e}"
+                )
+            else:
+                unmatched_pct = (result['unmatched_count'] / result['total_elements']) * 100
+                print_rank0(f"  {output_name}: {status} "
+                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
+                           f"MAX_DIFF: {result['max_diff']:.2e}, "
+                           f"unmatched: {result['unmatched_count']}/{result['total_elements']} "
+                           f"({unmatched_pct:.2f}%))")
+
+    # flux_outs = flux_forward(args,
+    #              o_proj, vllm_moe_layer,
+    #              hidden_size_per_tp, router_logits,
+    #              q, k, v, out, 
+    #              cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
+    #              window_size, block_tables, soft_cap, fa_version,
+    #              q_descale, k_descale, v_descale,
+    #             )
+    # names = ['attn_out', 'proj_out', 'moe_out']
+
+    # results = {}
+    # for name, vllm_out, flux_out in zip(names, vllm_outs, flux_outs):
+    #     test_tensors(vllm_out, flux_out, name, results)
+    # for output_name, is_close in results.items():
+    #     status = "✅ PASS" if is_close else "❌ FAIL"
+    #     print(f"  {output_name}: {status}")
 
     # bench
     # quantiles = [0.5, 0.2, 0.8]
