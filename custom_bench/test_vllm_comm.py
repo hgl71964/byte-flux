@@ -270,7 +270,6 @@ def main():
     print_rank0(f'ar_out: {ar_out.shape}, rs_out: {rs_out.shape}, ag_out: {ag_out.shape}')
     test_tensors(ar_out, ag_out, 'out', r)
 
-
     # higher precision
     if dtype == torch.bfloat16:
         ar_out_fp32 = tensor_model_parallel_all_reduce(partial_out.float())

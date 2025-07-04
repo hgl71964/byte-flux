@@ -545,6 +545,27 @@ def test_tensors(ref_out, test_out, name, results):
             ref_out, test_out,
         )
 
+def test_results(results):
+    for output_name, result in results.items():
+        if 'error' in result:
+            print_rank0(f"  {output_name}: ❌ FAIL - {result['error']}")
+        else:
+            status = "✅ PASS" if result['is_close'] else "❌ FAIL"
+            dtype_str = str(result['dtype']).replace('torch.', '') if result['dtype'] else 'Unknown'
+            
+            if result['is_close']:
+                print_rank0(f"  {output_name}: {status} "
+                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
+                           f"MAX_DIFF: {result['max_diff']:.2e}"
+                )
+            else:
+                unmatched_pct = (result['unmatched_count'] / result['total_elements']) * 100
+                print_rank0(f"  {output_name}: {status} "
+                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
+                           f"MAX_DIFF: {result['max_diff']:.2e}, "
+                           f"unmatched: {result['unmatched_count']}/{result['total_elements']} "
+                           f"({unmatched_pct:.2f}%))")
+
 @torch.no_grad()
 def vllm_forward(args,
                 o_proj, vllm_moe_layer,
@@ -815,26 +836,7 @@ def main():
         # if name == 'proj_out':
         #     print_rank0(vllm_out)
         #     print_rank0(break_out)
-
-    for output_name, result in results.items():
-        if 'error' in result:
-            print_rank0(f"  {output_name}: ❌ FAIL - {result['error']}")
-        else:
-            status = "✅ PASS" if result['is_close'] else "❌ FAIL"
-            dtype_str = str(result['dtype']).replace('torch.', '') if result['dtype'] else 'Unknown'
-            
-            if result['is_close']:
-                print_rank0(f"  {output_name}: {status} "
-                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
-                           f"MAX_DIFF: {result['max_diff']:.2e}"
-                )
-            else:
-                unmatched_pct = (result['unmatched_count'] / result['total_elements']) * 100
-                print_rank0(f"  {output_name}: {status} "
-                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
-                           f"MAX_DIFF: {result['max_diff']:.2e}, "
-                           f"unmatched: {result['unmatched_count']}/{result['total_elements']} "
-                           f"({unmatched_pct:.2f}%))")
+    test_results(results)
 
     # flux_outs = flux_forward(args,
     #              o_proj, vllm_moe_layer,
