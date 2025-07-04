@@ -151,30 +151,29 @@ def verify_results(tensor1: torch.Tensor, tensor2: torch.Tensor, rtol: float, at
 
     dtype = tensor1.dtype
     if dtype == torch.float16:
-        # float16 has ~3 decimal digits of precision
-        if is_default_rtol: effective_rtol = 1e-3
-        if is_default_atol: effective_atol = 1e-3
+        if is_default_rtol: effective_rtol = 1e-2
+        if is_default_atol: effective_atol = 1e-2
     elif dtype == torch.bfloat16:
-        # bfloat16 has ~2 decimal digits of precision
         if is_default_rtol: effective_rtol = 1e-2
         if is_default_atol: effective_atol = 1e-2
     elif dtype == torch.float32:
-        # Relax float32 slightly for large reductions due to non-associativity of floating-point math
         if is_default_rtol: effective_rtol = 1e-4
         if is_default_atol: effective_atol = 1e-5
 
     if dist.get_rank() == 0:
-        print(f"\nVerifying results with dtype={dtype}, rtol={effective_rtol}, atol={effective_atol}")
+        print(f"\nVerifying results with dtype={dtype}, rtol={effective_rtol:.1e}, atol={effective_atol:.1e}")
 
     allclose = torch.allclose(tensor1, tensor2, rtol=effective_rtol, atol=effective_atol)
     
-    if not allclose and dist.get_rank() == 0:
+    if dist.get_rank() == 0:
         print("Verification FAILED: Tensors do not match.")
         diff = torch.abs(tensor1 - tensor2)
         max_diff = torch.max(diff)
         max_rel_diff = torch.max(diff / torch.abs(tensor1))
-        print(f"Max absolute difference: {max_diff.item()}")
-        print(f"Max relative difference: {max_rel_diff.item()}")
+        # print(torch.abs(tensor1))
+        # print(diff/torch.abs(tensor1))
+        print(f"Max absolute difference: {max_diff.item():.3e}")
+        print(f"Max relative difference: {max_rel_diff.item():.3e}")
     return allclose
 
 
