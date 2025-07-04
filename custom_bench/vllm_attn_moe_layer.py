@@ -617,9 +617,9 @@ def breakdown_forward(args,
     print_rank0(f'partial_out: {partial_out.shape}, proj_out: {proj_out.shape}, reduce: {o_proj.reduce_results}, tp_size: {o_proj.tp_size}, weights: {o_proj.weight.shape}, bias: {o_proj.bias}')
 
     ## RS+AG
-    # reduced_scattered_out = tensor_model_parallel_reduce_scatter(partial_out,0)
-    # proj_out = tensor_model_parallel_all_gather(reduced_scattered_out,0)
-    # print_rank0(f'partial_out: {partial_out.shape}, reduced_scattered_out: {reduced_scattered_out.shape}, proj_out: {proj_out.shape},')
+    reduced_scattered_out = tensor_model_parallel_reduce_scatter(partial_out,0)
+    proj_out = tensor_model_parallel_all_gather(reduced_scattered_out,0)
+    print_rank0(f'partial_out: {partial_out.shape}, reduced_scattered_out: {reduced_scattered_out.shape}, proj_out: {proj_out.shape},')
 
     # vllm_out = vllm_moe_layer(proj_out, router_logits)
     # print_rank0(f'vllm_out: {vllm_out.shape}')
@@ -765,37 +765,6 @@ def main():
     # torch.distributed.breakpoint(0)
 
     dist.barrier()
-    partial_out = torch.randn(2048, 4096, device=device, dtype=dtype)
-    ar_out = tensor_model_parallel_all_reduce(partial_out)
-    reduced_scattered_out = tensor_model_parallel_reduce_scatter(partial_out,0)
-    ag_out = tensor_model_parallel_all_gather(reduced_scattered_out,0)
-    print_rank0(f'ar_out: {ar_out.shape}, ag_out: {ag_out.shape}')
-
-    r = {}
-    test_tensors(ar_out, ag_out, 'out', r)
-    for output_name, result in r.items():
-        if 'error' in result:
-            print_rank0(f"  {output_name}: ❌ FAIL - {result['error']}")
-        else:
-            status = "✅ PASS" if result['is_close'] else "❌ FAIL"
-            dtype_str = str(result['dtype']).replace('torch.', '') if result['dtype'] else 'Unknown'
-            
-            if result['is_close']:
-                print_rank0(f"  {output_name}: {status} "
-                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
-                           f"MAX_DIFF: {result['max_diff']:.2e}"
-                )
-            else:
-                unmatched_pct = (result['unmatched_count'] / result['total_elements']) * 100
-                print_rank0(f"  {output_name}: {status} "
-                           f"(dtype: {dtype_str}, threshold: {result['threshold']:.2e}, "
-                           f"MAX_DIFF: {result['max_diff']:.2e}, "
-                           f"unmatched: {result['unmatched_count']}/{result['total_elements']} "
-                           f"({unmatched_pct:.2f}%))")
-    dist.barrier()
-
-
-    
     # model
     vllm_moe_layer = FusedMoE_(num_experts=args.num_experts,
                             top_k=args.num_experts_per_tok,

@@ -206,6 +206,14 @@ def test_tensors(ref_out, test_out, name, results):
             ref_out, test_out,
         )
 
+def create_test_tensor(size: Tuple[int, ...], device: torch.device, rank: int, dtype: torch.dtype) -> torch.Tensor:
+    # Create tensor in float32 for high-precision initial values.
+    tensor_fp32 = torch.randn(size, device=device, dtype=torch.float32)
+    # Add rank-specific offset for easier verification.
+    tensor_fp32 += rank * 0.1
+    # Cast to the target dtype.
+    return tensor_fp32.to(dtype)
+
 def main():
     args = parse_args()
 
@@ -252,7 +260,7 @@ def main():
     dist.barrier()
 
     r = {}
-    partial_out = torch.randn(2048, 4096, device=device, dtype=dtype)
+    partial_out = create_test_tensor((2048, 4096), device, rank, dtype)
 
     # AR - RS+AG
     ar_out = tensor_model_parallel_all_reduce(partial_out)
@@ -264,13 +272,14 @@ def main():
 
 
     # higher precision
-    ar_out_fp32 = tensor_model_parallel_all_reduce(partial_out.float())
-    ar_out_accurate = ar_out_fp32.bfloat16()
+    if dtype == torch.bfloat16:
+        ar_out_fp32 = tensor_model_parallel_all_reduce(partial_out.float())
+        ar_out_accurate = ar_out_fp32.bfloat16()
 
-    rs_out_fp32 = tensor_model_parallel_reduce_scatter(partial_out.float(), 0)
-    ag_out_fp32 = tensor_model_parallel_all_gather(rs_out_fp32, 0)
-    ag_out_accurate = ag_out_fp32.bfloat16()
-    test_tensors(ar_out_accurate, ag_out_accurate, 'fp32-out', r)
+        rs_out_fp32 = tensor_model_parallel_reduce_scatter(partial_out.float(), 0)
+        ag_out_fp32 = tensor_model_parallel_all_gather(rs_out_fp32, 0)
+        ag_out_accurate = ag_out_fp32.bfloat16()
+        test_tensors(ar_out_accurate, ag_out_accurate, 'fp32-out', r)
 
     # test:
     for output_name, result in r.items():

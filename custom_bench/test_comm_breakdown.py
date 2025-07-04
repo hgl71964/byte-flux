@@ -12,6 +12,14 @@ DTYPE_MAP = {
     'bfloat16': torch.bfloat16,
 }
 
+# XXX: fp8 is not supported by NCCL
+# Add FP8 types if they are available in the current PyTorch version for backward compatibility
+if hasattr(torch, 'float8_e4m3fn'):
+    DTYPE_MAP['float8_e4m3fn'] = torch.float8_e4m3fn
+if hasattr(torch, 'float8_e5m2'):
+    DTYPE_MAP['float8_e5m2'] = torch.float8_e5m2
+
+
 def setup_distributed():
     """Initialize distributed training environment."""
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -43,11 +51,17 @@ def setup_distributed():
 
 
 def create_test_tensor(size: Tuple[int, ...], device: torch.device, rank: int, dtype: torch.dtype) -> torch.Tensor:
-    """Create a test tensor with rank-specific values and a given dtype."""
-    tensor = torch.randn(size, device=device, dtype=dtype)
-    # Add rank-specific offset for easier verification. Cast to tensor's dtype.
-    tensor += torch.tensor(rank * 0.1, device=device, dtype=dtype)
-    return tensor
+    """
+    Create a test tensor with rank-specific values and a given dtype.
+    The tensor is created in float32 and then cast to the target dtype
+    to ensure reproducibility and avoid creation errors with low-precision types.
+    """
+    # Create tensor in float32 for high-precision initial values.
+    tensor_fp32 = torch.randn(size, device=device, dtype=torch.float32)
+    # Add rank-specific offset for easier verification.
+    tensor_fp32 += rank * 0.1
+    # Cast to the target dtype.
+    return tensor_fp32.to(dtype)
 
 
 def benchmark_all_reduce(tensor: torch.Tensor, warmup_iters: int = 5, benchmark_iters: int = 100) -> Tuple[torch.Tensor, float]:
@@ -56,12 +70,12 @@ def benchmark_all_reduce(tensor: torch.Tensor, warmup_iters: int = 5, benchmark_
     for _ in range(warmup_iters):
         temp_tensor = tensor.clone()
         dist.all_reduce(temp_tensor, op=dist.ReduceOp.SUM)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     
     # Get the correct result first for verification
     result_tensor = tensor.clone()
     dist.all_reduce(result_tensor, op=dist.ReduceOp.SUM)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     
     start_time = time.time()
     
@@ -71,7 +85,7 @@ def benchmark_all_reduce(tensor: torch.Tensor, warmup_iters: int = 5, benchmark_
         # not a sequence of reductions on an ever-increasing tensor value.
         temp_tensor = tensor.clone()
         dist.all_reduce(temp_tensor, op=dist.ReduceOp.SUM)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     end_time = time.time()
     avg_time = (end_time - start_time) / benchmark_iters
@@ -106,7 +120,7 @@ def benchmark_reduce_scatter_all_gather(tensor: torch.Tensor, warmup_iters: int 
         temp_tensor = tensor_flat.clone()
         dist.reduce_scatter(scattered_tensor, list(temp_tensor.chunk(world_size)), op=dist.ReduceOp.SUM)
         dist.all_gather(gathered_tensors_list, scattered_tensor)
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     
     # Do one final operation to get the correct result for verification
     temp_result_tensor = tensor_flat.clone()
@@ -120,7 +134,7 @@ def benchmark_reduce_scatter_all_gather(tensor: torch.Tensor, warmup_iters: int 
     result_tensor = result_tensor.reshape(original_shape)
     
     # Benchmark timing
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     start_time = time.time()
     
     for _ in range(benchmark_iters):
@@ -132,7 +146,7 @@ def benchmark_reduce_scatter_all_gather(tensor: torch.Tensor, warmup_iters: int 
         dist.reduce_scatter(scattered_tensor, input_list, op=dist.ReduceOp.SUM)
         dist.all_gather(gathered_tensors_list, scattered_tensor)
         
-    torch.cuda.synchronize()
+    if torch.cuda.is_available(): torch.cuda.synchronize()
     end_time = time.time()
     avg_time = (end_time - start_time) / benchmark_iters
     
@@ -150,12 +164,17 @@ def verify_results(tensor1: torch.Tensor, tensor2: torch.Tensor, rtol: float, at
     is_default_atol = (atol == 1e-8)
 
     dtype = tensor1.dtype
-    if dtype == torch.float16:
+    is_fp8 = hasattr(torch, 'float8_e4m3fn') and dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+    if is_fp8:
+        # FP8 has very low precision (e.g., 3 mantissa bits for e4m3),
+        # so very high tolerances are required for verification.
+        if is_default_rtol: effective_rtol = 2e-1 # 0.2
+        if is_default_atol: effective_atol = 2e-1 # 0.2
+    elif dtype == torch.float16:
         if is_default_rtol: effective_rtol = 1e-2
         if is_default_atol: effective_atol = 1e-2
     elif dtype == torch.bfloat16:
-        # if is_default_rtol: effective_rtol = 1e-2
-        # if is_default_atol: effective_atol = 1e-2
         if is_default_rtol: effective_rtol = 7e-2
         if is_default_atol: effective_atol = 7e-2
     elif dtype == torch.float32:
@@ -168,11 +187,10 @@ def verify_results(tensor1: torch.Tensor, tensor2: torch.Tensor, rtol: float, at
     allclose = torch.allclose(tensor1, tensor2, rtol=effective_rtol, atol=effective_atol)
     
     if dist.get_rank() == 0:
-        diff = torch.abs(tensor1 - tensor2)
+        diff = torch.abs(tensor1.float() - tensor2.float()) # Cast to float for stable diff calculation
         max_diff = torch.max(diff)
-        max_rel_diff = torch.max(diff / torch.abs(tensor1))
-        # print(torch.abs(tensor1))
-        # print(diff/torch.abs(tensor1))
+        # Add a small epsilon to avoid division by zero
+        max_rel_diff = torch.max(diff / (torch.abs(tensor1.float()) + 1e-9))
         print(f"Max absolute difference: {max_diff.item():.3e}")
         print(f"Max relative difference: {max_rel_diff.item():.3e}")
     return allclose
@@ -237,8 +255,8 @@ def print_results(rank: int, world_size: int, tensor_size: Tuple[int, ...],
 
 def main():
     parser = argparse.ArgumentParser(description='PyTorch Distributed Communication Benchmark')
-    parser.add_argument('--tensor-size', type=int, nargs='+', default=[1024, 1024], 
-                        help='Tensor dimensions (default: 1024 1024)')
+    parser.add_argument('--tensor-size', type=int, nargs='+', default=[4096, 4096], 
+                        help='Tensor dimensions (default: 4096 4096)')
     parser.add_argument('--dtype', type=str, default='float32', choices=DTYPE_MAP.keys(),
                         help=f'Data type for the tensor (default: float32)')
     parser.add_argument('--warmup-iters', type=int, default=10, 
@@ -256,9 +274,12 @@ def main():
     
     selected_dtype = DTYPE_MAP[args.dtype]
     
+    # Check for hardware support for selected dtypes
     if 'cuda' in device.type:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is selected as device but not available.")
+        
+        # Check for bfloat16 support
         if selected_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             if rank == 0:
                 print(f"Warning: bfloat16 is not supported on this device. Skipping benchmark.")
@@ -273,6 +294,12 @@ def main():
     if rank == 0:
         print(f"Starting benchmark on {world_size} process(es)...")
     
+    # Single process case doesn't need distributed ops
+    if world_size == 1:
+        if rank == 0:
+             print("World size is 1, skipping distributed benchmarks.")
+        return
+
     # Benchmark all-reduce
     all_reduce_result, all_reduce_time = benchmark_all_reduce(
         test_tensor, args.warmup_iters, args.benchmark_iters
@@ -284,10 +311,7 @@ def main():
     )
     
     # Verify results match
-    if world_size > 1:
-        results_match = verify_results(all_reduce_result, rs_ag_result, args.rtol, args.atol)
-    else:
-        results_match = True  # Single process case always matches
+    results_match = verify_results(all_reduce_result, rs_ag_result, args.rtol, args.atol)
     
     # Print results
     print_results(rank, world_size, tensor_size, args.dtype, all_reduce_time, 
