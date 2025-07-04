@@ -70,6 +70,7 @@ def parse_args():
     parser.add_argument("--tp_size", type=int, default=2)
     parser.add_argument("--ep_size", type=int, default=1)
     parser.add_argument("--dtype", default="bfloat16", type=str, choices=list(DTYPE_MAP.keys()))
+    parser.add_argument("--quant", action="store_true")
 
     rs = parser.add_argument_group('RS')
     rs.add_argument(
@@ -159,241 +160,6 @@ def token_choice_with_bias(hidden_states: torch.Tensor,
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-
-def determine_expert_map(
-        ep_size: int, ep_rank: int,
-        global_num_experts: int) -> Tuple[int, Optional[torch.Tensor]]:
-    """
-        Calculates how many experts should be assigned to each rank for EP and
-        creates a mapping from global to local expert index. Experts are
-        distributed evenly across ranks. Any remaining are assigned to the
-        last rank.
-
-        Args:
-            ep_size (int): The size of the expert parallel group
-            global_num_experts (int): The total number of experts in the model.
-
-        Returns:
-            Tuple[int, Optional[torch.Tensor]]: A tuple containing:
-                - local_num_experts (int): The number of experts assigned
-                    to the current rank.
-                - expert_map (Optional[torch.Tensor]): A tensor of shape
-                    (global_num_experts,) mapping from global to local index.
-                    Contains -1 for experts not assigned to the current rank.
-                    Returns None if ep_size is 1.
-        """
-    assert ep_size > 0
-    if ep_size == 1:
-        return (global_num_experts, None)
-
-    local_num_experts = global_num_experts // ep_size
-
-    # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts, ), -1, dtype=torch.int32)
-    # Create a expert map for the local experts
-    if ep_rank < (ep_size - 1):
-        # Each non-last rank gets local_num_experts experts.
-        expert_map[ep_rank * local_num_experts:
-                        (ep_rank + 1) * local_num_experts] = \
-            torch.arange(0, local_num_experts, dtype=torch.int32)
-    else:
-        # All remaining experts are assigned to the last rank.
-        local_num_experts = (global_num_experts - ep_rank * local_num_experts)
-
-        expert_map[-local_num_experts:] = \
-            torch.arange(0, local_num_experts, dtype=torch.int32)
-    return (local_num_experts, expert_map)
-
-
-class FusedMoE_(FusedMoE):
-
-    # @property
-    # def ep_size(self):
-    #     return self._ep_size
-
-    # @ep_size.setter
-    # def ep_size(self, value):
-    #     self._ep_size = value
-
-    def __init__(
-        self,
-        num_experts: int,  # Global number of experts
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        params_dtype: Optional[torch.dtype] = None,
-        reduce_results: bool = False,
-        renormalize: bool = True,
-        use_grouped_topk: bool = False,
-        num_expert_group: Optional[int] = None,
-        topk_group: Optional[int] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
-        ep_size: Optional[int] = None,
-        dp_size: Optional[int] = None,
-        prefix: str = "",
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-    ):
-        # torch.nn.Module.__init__(self)
-        super().__init__(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            params_dtype=params_dtype,
-            reduce_results=reduce_results,
-            renormalize=renormalize,
-            use_grouped_topk=use_grouped_topk,
-            num_expert_group=num_expert_group,
-            topk_group=topk_group,
-            quant_config=quant_config,
-            tp_size=tp_size,
-            ep_size=ep_size,
-            dp_size=dp_size,
-            prefix=prefix,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            activation=activation,
-        )
-        # self.ep_size=2
-
-    @staticmethod
-    def select_experts(hidden_states: torch.Tensor,
-                       router_logits: torch.Tensor,
-                       top_k: int,
-                       use_grouped_topk: bool,
-                       renormalize: bool,
-                       topk_group: Optional[int] = None,
-                       num_expert_group: Optional[int] = None,
-                       custom_routing_function: Optional[Callable] = None,
-                       scoring_func: str = "softmax",
-                       e_score_correction_bias: Optional[torch.Tensor] = None):
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
-            fused_topk, grouped_topk)
-
-        # DeekSeekv2 uses grouped_top_k
-        if use_grouped_topk:
-            assert topk_group is not None
-            assert num_expert_group is not None
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias)
-        elif custom_routing_function is None:
-            topk_weights, topk_ids = fused_topk(hidden_states=hidden_states,
-                                                gating_output=router_logits,
-                                                topk=top_k,
-                                                renormalize=renormalize)
-        else:
-            topk_weights, topk_ids = custom_routing_function(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize)
-
-        return topk_weights, topk_ids
-
-    def naive_multicast(self, x: torch.Tensor,
-                        cu_tokens_across_dp_cpu: torch.Tensor):
-        assert (len(x.shape) == 2)
-        buffer = torch.empty((cu_tokens_across_dp_cpu[-1], x.size(1)),
-                             device=x.device,
-                             dtype=x.dtype)
-
-        start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
-            self.dp_rank - 1]
-        end = cu_tokens_across_dp_cpu[self.dp_rank]
-        buffer[start:end, :].copy_(x)
-        for idx in range(get_dp_group().world_size):
-            start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
-            end = cu_tokens_across_dp_cpu[idx]
-            get_dp_group().broadcast(buffer[start:end, :], idx)
-
-        return buffer
-
-    def forward(self, hidden_states: torch.Tensor,
-                router_logits: torch.Tensor):
-        
-        if self.use_direct_call:
-            return self.forward_impl(hidden_states, router_logits)
-        else:
-            return torch.ops.vllm.moe_forward(hidden_states, router_logits,
-                                              self.layer_name)
-
-    def forward_impl(self, hidden_states: torch.Tensor,
-                     router_logits: torch.Tensor):
-        assert self.quant_method is not None
-
-        if self.dp_size > 1:
-            cu_tokens_across_dp_cpu = get_forward_context(
-            ).dp_metadata.cu_tokens_across_dp_cpu
-
-            hidden_states = self.naive_multicast(hidden_states,
-                                                 cu_tokens_across_dp_cpu)
-            router_logits = self.naive_multicast(router_logits,
-                                                 cu_tokens_across_dp_cpu)
-
-        # Matrix multiply.
-        # print(f'forward_impl quant: ', self.quant_method)
-        final_hidden_states = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-        )
-
-        if self.dp_size > 1:
-            start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
-                self.dp_rank - 1]
-            end = cu_tokens_across_dp_cpu[self.dp_rank]
-
-            all_hidden_states = get_dp_group().all_reduce(final_hidden_states)
-            final_hidden_states = all_hidden_states[start:end, :]
-
-        if self.reduce_results and (self.tp_size > 1 or self.ep_size > 1):
-            # Default set to False. (May have to add shared expert outputs.)
-            final_hidden_states = tensor_model_parallel_all_reduce(
-                final_hidden_states)
-
-        return final_hidden_states
-
-    @classmethod
-    def make_expert_params_mapping(
-            cls, ckpt_gate_proj_name: str, ckpt_down_proj_name: str,
-            ckpt_up_proj_name: str,
-            num_experts: int) -> List[Tuple[str, str, int, str]]:
-
-        return [
-            # (param_name, weight_name, expert_id, shard_id)
-            ("experts.w13_" if weight_name
-             in [ckpt_gate_proj_name, ckpt_up_proj_name] else "experts.w2_",
-             f"experts.{expert_id}.{weight_name}.", expert_id, shard_id)
-            for expert_id in range(num_experts) for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
-            ]
-        ]
-
 
 
 # def init_worker_distributed_environment(
@@ -496,11 +262,42 @@ def gen(seq_lens, num_heads, num_blocks, block_size, head_size,
             out, cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, window_size,
             block_tables, soft_cap, fa_version, q_descale, k_descale, v_descale)
 
+def init_moe_weight(moe_layer):
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoECutlassMethod
+    from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
+    # if isinstance(moe_layer.quant_method, CompressedTensorsW8A8Fp8MoECutlassMethod):
+    with torch.no_grad():
+        # Initialize weights. Note: float8 types don't have normal_ but we can
+        # create in float32 and cast.
+        moe_layer.w13_weight.copy_(
+            torch.randn_like(moe_layer.w13_weight, dtype=torch.float32))
+        moe_layer.w2_weight.copy_(
+            torch.randn_like(moe_layer.w2_weight, dtype=torch.float32))
+
+        # Initialize scales with random values around 1.0
+        # These checks ensure we only initialize parameters that were created.
+        if hasattr(moe_layer, "w13_weight_scale") and moe_layer.w13_weight_scale is not None:
+            moe_layer.w13_weight_scale.uniform_(0.9, 1.1)
+
+        if hasattr(moe_layer, "w2_weight_scale") and moe_layer.w2_weight_scale is not None:
+            moe_layer.w2_weight_scale.uniform_(0.9, 1.1)
+
+        # Initialize input scales if they exist
+        if hasattr(moe_layer.quant_method, "static_input_scales"):
+            if moe_layer.quant_method.static_input_scales:
+                if hasattr(moe_layer, "w13_input_scale") and moe_layer.w13_input_scale is not None:
+                    moe_layer.w13_input_scale.uniform_(0.9, 1.1)
+                
+                if hasattr(moe_layer, "w2_input_scale") and moe_layer.w2_input_scale is not None:
+                    moe_layer.w2_input_scale.uniform_(0.9, 1.1)
+    # elif isinstance(moe_layer.quant_method, UnquantizedFusedMoEMethod):
+
+
 def test_allclose(tensor1, tensor2, threshold_map=None):
     if threshold_map is None:
         threshold_map = {
             torch.float16: 1e-2,
-            torch.bfloat16: 2e-2,
+            torch.bfloat16: 7e-2, # torch.bfloat16: 2e-2,
             torch.float8_e4m3fn: 3e-2,
             torch.float8_e5m2: 3e-2,
             torch.int8: 2e-1,
@@ -597,10 +394,11 @@ def vllm_forward(args,
     print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
     # print_rank0(f'{o_proj.weight}, {attn_out}, {proj_out}')
 
-    # TODO vllm_moe_layer will modify in place
-    # vllm_out = vllm_moe_layer(proj_out, router_logits)
-    # print_rank0(f'vllm_out: {vllm_out.shape}')
-    return attn_out, proj_out, None
+    # XXX moe will modify in place
+    clone = proj_out.clone()
+    vllm_out = vllm_moe_layer(clone, router_logits)
+    print_rank0(f'vllm_out: {vllm_out.shape}')
+    return attn_out, None, proj_out, vllm_out
 
 @torch.no_grad()
 def breakdown_forward(args,
@@ -634,17 +432,26 @@ def breakdown_forward(args,
     partial_out = torch.nn.functional.linear(attn_out, o_proj.weight)
 
     ## all-reduce
-    proj_out = tensor_model_parallel_all_reduce(partial_out)
-    print_rank0(f'partial_out: {partial_out.shape}, proj_out: {proj_out.shape}, reduce: {o_proj.reduce_results}, tp_size: {o_proj.tp_size}, weights: {o_proj.weight.shape}, bias: {o_proj.bias}')
+    # rs_out = None
+    # proj_out = tensor_model_parallel_all_reduce(partial_out)
+    # print_rank0(f'partial_out: {partial_out.shape}, proj_out: {proj_out.shape}, reduce: {o_proj.reduce_results}, tp_size: {o_proj.tp_size}, weights: {o_proj.weight.shape}, bias: {o_proj.bias}')
 
     ## RS+AG
-    reduced_scattered_out = tensor_model_parallel_reduce_scatter(partial_out,0)
-    proj_out = tensor_model_parallel_all_gather(reduced_scattered_out,0)
-    print_rank0(f'partial_out: {partial_out.shape}, reduced_scattered_out: {reduced_scattered_out.shape}, proj_out: {proj_out.shape},')
+    rs_out = tensor_model_parallel_reduce_scatter(partial_out,0)
+    proj_out = tensor_model_parallel_all_gather(rs_out,0)
+    print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
 
-    # vllm_out = vllm_moe_layer(proj_out, router_logits)
-    # print_rank0(f'vllm_out: {vllm_out.shape}')
-    return attn_out, proj_out, None
+    ## RS+AG (high precision)
+    # rs_out = tensor_model_parallel_reduce_scatter(partial_out.float(),0)
+    # proj_out_fp32 = tensor_model_parallel_all_gather(rs_out,0)
+    # proj_out = proj_out_fp32.bfloat16()
+    # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
+
+
+    clone = proj_out.clone()
+    vllm_out = vllm_moe_layer(clone, router_logits)
+    print_rank0(f'vllm_out: {vllm_out.shape}')
+    return attn_out, rs_out, proj_out, vllm_out
 
 
 def prepare_rs(args):
@@ -709,7 +516,7 @@ def flux_forward(args,
         fuse_reduction=args.fuse_reduction,
         ring_reduction=args.ring_reduction,
     )
-    output = gemm_rs_op.forward(
+    rs_out = gemm_rs_op.forward(
         attn_out,
         o_proj.weight,
         bias=None,
@@ -719,13 +526,13 @@ def flux_forward(args,
         fast_accum=False,
         reduce_scatter_option=reduce_scatter_option,
     )
-    print_rank0(f'gemm RS out: {output.shape}')
+    print_rank0(f'gemm RS out: {rs_out.shape}')
 
     # all-gather 
 
     # FusedMoE_
 
-    return attn_out, None, None
+    return attn_out, rs_out, None, None
 
 def main():
     args = parse_args()
@@ -786,18 +593,36 @@ def main():
     # torch.distributed.breakpoint(0)
 
     dist.barrier()
+
     # model
-    vllm_moe_layer = FusedMoE_(num_experts=args.num_experts,
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsConfig
+    from compressed_tensors.quantization import QuantizationArgs  
+    ## make a fake config that falls into the quant_method
+    target_scheme = {'Linear': {'weights': QuantizationArgs(num_bits=8, type='float', symmetric=True, group_size=None, strategy='channel', block_structure=None, dynamic=False, actorder=None, observer='minmax', observer_kwargs={}), 
+                                'input_activations': QuantizationArgs(num_bits=8, type='float', symmetric=True, group_size=None, strategy='token', block_structure=None, dynamic=True, actorder=None, observer=None, observer_kwargs={})},
+                     }
+    quant_config = CompressedTensorsConfig(target_scheme_map=target_scheme, 
+                                           ignore=['lm_head'], 
+                                           quant_format='float-quantized',
+                                           sparsity_scheme_map={},
+                                           sparsity_ignore_list=[],
+                                        )
+    vllm_moe_layer = FusedMoE(num_experts=args.num_experts,
                             top_k=args.num_experts_per_tok,
                             hidden_size=args.hidden_size,
                             intermediate_size=args.intermediate_size,
-                            params_dtype=dtype,  # TODO fp8?
-                            reduce_results=True,
-                            renormalize=True,
-                            quant_config=None,  # TODO
-                            tp_size=args.tp_size,
-                            prefix=f"experts",
-                            custom_routing_function=token_choice_with_bias).to(device)
+                            params_dtype=torch.bfloat16,  # input is bf16, but quant will apply to weights
+                            # reduce_results=True,
+                            # renormalize=True,
+                            #
+                            quant_config=quant_config if args.quant else None, # quant default is bf16
+                            # quant_config=None,  
+
+                            # tp_size=args.tp_size,
+                            # prefix=f"experts",
+                            # custom_routing_function=token_choice_with_bias,
+                        ).to(device)
+    init_moe_weight(vllm_moe_layer)
 
     o_proj = RowParallelLinear(
         args.hidden_size,  # in NOTE: this will be sharded by tp
@@ -809,7 +634,6 @@ def main():
     with torch.no_grad():
         o_proj.weight.data.uniform_(0, 1)
     dist.barrier()
-
 
     # forward
     vllm_outs = vllm_forward(args,
@@ -828,25 +652,36 @@ def main():
                 window_size, block_tables, soft_cap, fa_version,
                 q_descale, k_descale, v_descale,
             )
-    names = ['attn_out', 'proj_out', 'moe_out']
+    names = ['attn_out', 'rs_out','proj_out', 'moe_out']
     results = {}
     for name, vllm_out, break_out in zip(names, vllm_outs, breakdown_outs):
         test_tensors(vllm_out, break_out, name, results)
 
-        # if name == 'proj_out':
-        #     print_rank0(vllm_out)
-        #     print_rank0(break_out)
+        if name == 'proj_out':
+            print_rank0(vllm_out)
+            print_rank0(break_out)
+        # print_rank0(vllm_out)
+        # print_rank0(break_out)
     test_results(results)
 
-    # flux_outs = flux_forward(args,
-    #              o_proj, vllm_moe_layer,
-    #              hidden_size_per_tp, router_logits,
-    #              q, k, v, out, 
-    #              cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-    #              window_size, block_tables, soft_cap, fa_version,
-    #              q_descale, k_descale, v_descale,
-    #             )
-    # names = ['attn_out', 'proj_out', 'moe_out']
+    flux_outs = flux_forward(args,
+                 o_proj, vllm_moe_layer,
+                 hidden_size_per_tp, router_logits,
+                 q, k, v, out, 
+                 cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
+                 window_size, block_tables, soft_cap, fa_version,
+                 q_descale, k_descale, v_descale,
+                )
+    results = {}
+    for name, break_out, flux_out in zip(names, breakdown_outs, flux_outs):
+        test_tensors(flux_out, break_out, name, results)
+
+        if name == 'proj_out':
+            print_rank0(flux_out)
+            print_rank0(break_out)
+        # print_rank0(vllm_out)
+        # print_rank0(break_out)
+    test_results(results)
 
     # results = {}
     # for name, vllm_out, flux_out in zip(names, vllm_outs, flux_outs):

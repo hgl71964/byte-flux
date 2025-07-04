@@ -56,73 +56,8 @@ DTYPE_MAP = {
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--seq_len", type=int, default=2048)
-
-    parser.add_argument("--num_experts", type=int, default=128)
-    parser.add_argument("--num_experts_per_tok", type=int, default=8,help='topK')
-    parser.add_argument("--hidden_size", type=int, default=4096)
-    parser.add_argument("--intermediate_size", type=int, default=4096)
-
-    parser.add_argument("--params_dtype", type=str)
-    parser.add_argument("--quant_config", type=str)
-
     parser.add_argument("--tp_size", type=int, default=2)
-    parser.add_argument("--ep_size", type=int, default=1)
     parser.add_argument("--dtype", default="bfloat16", type=str, choices=list(DTYPE_MAP.keys()))
-
-    rs = parser.add_argument_group('RS')
-    rs.add_argument(
-        "--transpose_weight", default=False, action="store_true", help="whether to transpose weight"
-    )
-    rs.add_argument(
-        "--fuse_reduction", default=False, action="store_true", help="fuse reduction to gemm"
-    )
-    rs.add_argument(
-        "--ring_reduction",
-        default=False,
-        action="store_true",
-        help="reduce paritial output with ring order",
-    )
-    rs.add_argument("--has_bias", default=False, action="store_true", help="whether have bias")
-    rs.add_argument(
-        "--debug", action="store_true", help="debug mode. use human read input", default=False
-    )
-    rs.add_argument(
-        "--use_1d_ring",
-        action=argparse.BooleanOptionalAction,
-        help="use 1d ring for reduction",
-    )
-    rs.add_argument(
-        "--use_p2p_read",
-        action=argparse.BooleanOptionalAction,
-        help="use 1d ring for reduction",
-    )
-    rs.add_argument(
-        "--use_cudaMemcpyAsync",
-        action=argparse.BooleanOptionalAction,
-        help="use 1d ring for reduction",
-    )
-    rs.add_argument(
-        "--use_gemmk",
-        action=argparse.BooleanOptionalAction,
-        help="use 1d ring for reduction",
-    )
-    rs.add_argument(
-        "--per_tile_flags",
-        action=argparse.BooleanOptionalAction,
-        help="use 1d ring for reduction",
-    )
-    rs.add_argument(
-        "--reduce_scatter_blocks",
-        type=int,
-        help="number of blocks for reduce scatter",
-    )
-    rs.add_argument(
-        "--ring_mode",
-        choices=["ring1d", "ring2d"],
-        help="ring mode. auto for auto detect",
-    )
     args = parser.parse_args()
     return args
 
@@ -219,7 +154,7 @@ def main():
 
     # TORCH distributed
     local_rank, rank, world_size, device = setup_distributed()
-    assert args.tp_size * args.ep_size == world_size, (f'world_size: {world_size}, tp_size: {args.tp_size}, ep_size: {args.ep_size}')
+    assert args.tp_size == world_size
     print(f'world_size: {dist.get_world_size()}, tp_size: {args.tp_size}')
     print(f'rank: {dist.get_rank()} init on device: {device} and local_rank: {local_rank}')
     dist.barrier()
