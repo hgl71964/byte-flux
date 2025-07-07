@@ -394,9 +394,8 @@ def vllm_forward(args,
     print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
     # print_rank0(f'{o_proj.weight}, {attn_out}, {proj_out}')
 
-    # XXX moe will modify in place
     clone = proj_out.clone()
-    vllm_out = vllm_moe_layer(clone, router_logits)
+    vllm_out = vllm_moe_layer(clone, router_logits) # XXX moe will modify in place
     print_rank0(f'vllm_out: {vllm_out.shape}')
     return attn_out, None, proj_out, vllm_out
 
@@ -447,6 +446,16 @@ def breakdown_forward(args,
     # proj_out = proj_out_fp32.bfloat16()
     # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
 
+    ## RS+AG (torch)
+    # tp_group = get_tp_group().device_group
+    # tp_size = get_tensor_model_parallel_world_size()
+    # rs_out_shape = list(partial_out.shape)
+    # rs_out_shape[0] //= tp_size
+    # rs_out = torch.empty(rs_out_shape, dtype=partial_out.dtype, device=partial_out.device)
+    # dist.reduce_scatter_tensor(rs_out, partial_out, group=tp_group)
+    # proj_out = torch.empty_like(partial_out)
+    # dist.all_gather_into_tensor(proj_out, rs_out, group=tp_group)
+    # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape}')
 
     clone = proj_out.clone()
     vllm_out = vllm_moe_layer(clone, router_logits)

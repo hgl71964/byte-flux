@@ -56,6 +56,9 @@ DTYPE_MAP = {
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--debug", action="store_true", help="debug mode. use human read input", default=False
+    )
     parser.add_argument("--tp_size", type=int, default=2)
     parser.add_argument("--dtype", default="bfloat16", type=str, choices=list(DTYPE_MAP.keys()))
     args = parser.parse_args()
@@ -197,13 +200,25 @@ def main():
     r = {}
     partial_out = create_test_tensor((2048, 4096), device, rank, dtype)
 
+    if args.debug:
+        partial_out.zero_()
+        partial_out[:, 0].fill_(rank + 1)
+        print_rank0(f'partial_out: {partial_out}')
+    dist.barrier()
+
     # AR - RS+AG
     ar_out = tensor_model_parallel_all_reduce(partial_out)
-
     rs_out = tensor_model_parallel_reduce_scatter(partial_out,0)
     ag_out = tensor_model_parallel_all_gather(rs_out,0)
     print_rank0(f'ar_out: {ar_out.shape}, rs_out: {rs_out.shape}, ag_out: {ag_out.shape}')
+    print_rank0(f'*'*20)
     test_tensors(ar_out, ag_out, 'out', r)
+
+    if args.debug:
+        print_rank0(f'ar_out: {ar_out}')
+        print_rank0(f'rs_out: {rs_out}')
+        print_rank0(f'ag_out: {ag_out}')
+    dist.barrier()
 
     # higher precision
     if dtype == torch.bfloat16:

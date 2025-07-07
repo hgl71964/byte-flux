@@ -408,6 +408,7 @@ if __name__ == "__main__":
         print(f'{TP_GROUP}, {NNODES}')
         print(data_config)
         print(input.shape, weight.shape)
+        print(input.dtype, weight.dtype)
         print(bias, input_scale, weight_scale)
         print(args.transpose_weight, args.fuse_reduction, args.ring_reduction, args.use_gemmk)
         print(reduce_scatter_option)
