@@ -408,20 +408,6 @@ def breakdown_forward(args,
                 window_size, block_tables, soft_cap, fa_version, 
                 q_descale, k_descale, v_descale,
             ):
-    flash_attn_varlen_func(
-        q=q, k=k, v=v, out=out,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap,
-        fa_version=fa_version,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-    )
     attn_out = out.view(-1, hidden_size_per_tp)
     print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
     # print_rank0(f'parllel? {o_proj.input_is_parallel}, in {o_proj.input_size_per_partition}, out {o_proj.output_size_per_partition}, reduce {o_proj.reduce_results}')
@@ -656,7 +642,8 @@ def main():
     breakdown_outs = breakdown_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
-                q, k, v, torch.empty_like(out), 
+                # q, k, v, torch.empty_like(out), 
+                q, k, v, out,
                 cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
                 window_size, block_tables, soft_cap, fa_version,
                 q_descale, k_descale, v_descale,
