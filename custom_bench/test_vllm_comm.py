@@ -2,7 +2,6 @@
 
 import os
 from typing import Optional, Callable, Tuple, List
-from copy import deepcopy
 import numpy as np
 import random
 
@@ -10,19 +9,6 @@ import argparse
 import torch
 import torch.distributed as dist
 
-import triton
-
-
-from vllm.engine.arg_utils import EngineArgs
-from vllm.utils import FlexibleArgumentParser
-
-from vllm.config import get_current_vllm_config
-from vllm.platforms import current_platform
-from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
-
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce,
@@ -34,11 +20,6 @@ from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
 from vllm.distributed import (ensure_model_parallel_initialized,
                               init_distributed_environment,
                               set_custom_all_reduce)
-from vllm.vllm_flash_attn import flash_attn_varlen_func
-from vllm.model_executor.layers.linear import RowParallelLinear
-
-import flux
-from flux.cpp_mod import ReduceScatterOption
 
 
 def print_rank0(*args):
@@ -65,33 +46,20 @@ def parse_args():
     return args
 
 def init_seed(seed=0):
-    os.environ["NCCL_DEBUG"] = os.getenv("NCCL_DEBUG", "ERROR")
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.set_printoptions(precision=2)
     torch.manual_seed(3 + seed)
     torch.cuda.manual_seed_all(3 + seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     np.random.seed(3 + seed)
     random.seed(3 + seed)
-
-
 
 def setup_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    # Initialize the process group
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     device = torch.device(f'cuda:{local_rank}')
     torch.cuda.set_device(local_rank)
-
-    # Set the device
+    init_seed(rank)
     return local_rank, rank, world_size, device
 
 
@@ -162,7 +130,6 @@ def main():
     print(f'rank: {dist.get_rank()} init on device: {device} and local_rank: {local_rank}')
     dist.barrier()
 
-    local_rank = dist.get_rank()
     ranks = list(range(torch.distributed.get_world_size()))
     import vllm.distributed.parallel_state as mpu
     mpu._WORLD = init_world_group(ranks, local_rank, 'nccl')
@@ -170,33 +137,11 @@ def main():
         args.tp_size,
         1,  # args.pp_size,
     )
-
-    # FLUX
-    init_seed(rank)
-    print_rank0("[flux_shm] before initialization")
-    tp_group = get_tp_group()
-    flux.init_flux_shm(tp_group.device_group)
-    torch.cuda.synchronize()
-    print_rank0("[flux_shm] after initialization")
-
-    # from flux.testing import initialize_distributed
-    # TP_GROUP = initialize_distributed()
-    # RANK, WORLD_SIZE, NNODES = TP_GROUP.rank(), TP_GROUP.size(), flux.testing.NNODES()
-
     print(f'rank: {rank} init OK!')
     dist.barrier()
 
     # data
     dtype = DTYPE_MAP[args.dtype]
-    # M = args.batch_size * args.seq_len
-    # router_logits = torch.randn(M, args.num_experts, device=device, dtype=dtype)
-    # seq_lens = [(args.seq_len, args.seq_len) for _ in range(args.batch_size)]
-    # num_heads = (32, 32)
-    # hidden_size_per_tp = args.hidden_size // args.tp_size
-    # assert args.hidden_size % args.tp_size == 0 
-
-    dist.barrier()
-
     r = {}
     partial_out = create_test_tensor((2048, 4096), device, rank, dtype)
 
@@ -210,6 +155,8 @@ def main():
     ar_out = tensor_model_parallel_all_reduce(partial_out)
     rs_out = tensor_model_parallel_reduce_scatter(partial_out,0)
     ag_out = tensor_model_parallel_all_gather(rs_out,0)
+    torch.cuda.synchronize()
+    dist.barrier()
     print_rank0(f'ar_out: {ar_out.shape}, rs_out: {rs_out.shape}, ag_out: {ag_out.shape}')
     print_rank0(f'*'*20)
     test_tensors(ar_out, ag_out, 'out', r)
@@ -220,7 +167,7 @@ def main():
         print_rank0(f'ag_out: {ag_out}')
     dist.barrier()
 
-    # higher precision
+    # higher precision for bloat16 (all good)
     if dtype == torch.bfloat16:
         ar_out_fp32 = tensor_model_parallel_all_reduce(partial_out.float())
         ar_out_accurate = ar_out_fp32.bfloat16()
@@ -230,7 +177,7 @@ def main():
         ag_out_accurate = ag_out_fp32.bfloat16()
         test_tensors(ar_out_accurate, ag_out_accurate, 'fp32-out', r)
 
-    # test:
+    # print 
     for output_name, result in r.items():
         if 'error' in result:
             print_rank0(f"  {output_name}: ❌ FAIL - {result['error']}")
