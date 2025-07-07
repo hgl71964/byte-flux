@@ -368,26 +368,9 @@ def vllm_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
-                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                window_size, block_tables, soft_cap, fa_version, 
-                q_descale, k_descale, v_descale,
                 ):
-    flash_attn_varlen_func(
-        q=q, k=k, v=v, out=out,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap,
-        fa_version=fa_version,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-    )
     attn_out = out.view(-1, hidden_size_per_tp)
-    print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
+    # print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
     # print_rank0(f'parllel? {o_proj.input_is_parallel}, in {o_proj.input_size_per_partition}, out {o_proj.output_size_per_partition}, reduce {o_proj.reduce_results}')
 
     proj_out, _ = o_proj(attn_out)  # applied all-reduce
@@ -397,23 +380,19 @@ def vllm_forward(args,
     clone = proj_out.clone()
     vllm_out = vllm_moe_layer(clone, router_logits) # XXX moe will modify in place
     print_rank0(f'vllm_out: {vllm_out.shape}')
-    return attn_out, None, proj_out, vllm_out
+    return None, proj_out, vllm_out
 
 @torch.no_grad()
 def breakdown_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
-                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                window_size, block_tables, soft_cap, fa_version, 
-                q_descale, k_descale, v_descale,
             ):
     attn_out = out.view(-1, hidden_size_per_tp)
-    print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
+    # print_rank0(f'q: {q.shape}, k: {k.shape}, v: {v.shape}, out: {out.shape}, attn_out: {attn_out.shape}')
     # print_rank0(f'parllel? {o_proj.input_is_parallel}, in {o_proj.input_size_per_partition}, out {o_proj.output_size_per_partition}, reduce {o_proj.reduce_results}')
 
     assert o_proj.bias is None
-
     partial_out = torch.nn.functional.linear(attn_out, o_proj.weight)
 
     ## all-reduce
@@ -446,7 +425,7 @@ def breakdown_forward(args,
     clone = proj_out.clone()
     vllm_out = vllm_moe_layer(clone, router_logits)
     print_rank0(f'vllm_out: {vllm_out.shape}')
-    return attn_out, rs_out, proj_out, vllm_out
+    return rs_out, proj_out, vllm_out
 
 
 def prepare_rs(args):
@@ -468,24 +447,7 @@ def flux_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
-                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                window_size, block_tables, soft_cap, fa_version, 
-                q_descale, k_descale, v_descale,
             ):
-    flash_attn_varlen_func(
-        q=q, k=k, v=v, out=out,
-        cu_seqlens_q=cu_query_lens,
-        seqused_k=kv_lens,
-        max_seqlen_q=max_query_len,
-        max_seqlen_k=max_kv_len,
-        softmax_scale=scale,
-        causal=True,
-        window_size=window_size,
-        block_table=block_tables,
-        softcap=soft_cap,
-        fa_version=fa_version,
-        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-    )
     attn_out = out.view(-1, hidden_size_per_tp)
 
     # reduce-scatter + GEMM
@@ -527,7 +489,7 @@ def flux_forward(args,
 
     # FusedMoE_
 
-    return attn_out, rs_out, None, None
+    return rs_out, None, None
 
 def main():
     args = parse_args()
@@ -631,31 +593,38 @@ def main():
     dist.barrier()
 
     # forward
+    flash_attn_varlen_func(
+        q=q, k=k, v=v, out=out,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap,
+        fa_version=fa_version,
+        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+    )
     vllm_outs = vllm_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
-                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                window_size, block_tables, soft_cap, fa_version,
-                q_descale, k_descale, v_descale,
             )
     breakdown_outs = breakdown_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
-                # q, k, v, torch.empty_like(out), 
                 q, k, v, out,
-                cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                window_size, block_tables, soft_cap, fa_version,
-                q_descale, k_descale, v_descale,
             )
-    names = ['attn_out', 'rs_out','proj_out', 'moe_out']
+    names = ['rs_out','proj_out', 'moe_out']
     results = {}
     for name, vllm_out, break_out in zip(names, vllm_outs, breakdown_outs):
         test_tensors(vllm_out, break_out, name, results)
 
-        if name == 'proj_out':
-            print_rank0(vllm_out)
-            print_rank0(break_out)
+        # if name == 'proj_out':
+        #     print_rank0(vllm_out)
+        #     print_rank0(break_out)
         # print_rank0(vllm_out)
         # print_rank0(break_out)
     test_results(results)
@@ -664,9 +633,6 @@ def main():
                  o_proj, vllm_moe_layer,
                  hidden_size_per_tp, router_logits,
                  q, k, v, out, 
-                 cu_query_lens, kv_lens, max_query_len, max_kv_len, scale, 
-                 window_size, block_tables, soft_cap, fa_version,
-                 q_descale, k_descale, v_descale,
                 )
     results = {}
     for name, break_out, flux_out in zip(names, breakdown_outs, flux_outs):
