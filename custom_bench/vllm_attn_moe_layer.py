@@ -263,16 +263,15 @@ def gen(seq_lens, num_heads, num_blocks, block_size, head_size,
             block_tables, soft_cap, fa_version, q_descale, k_descale, v_descale)
 
 def init_moe_weight(moe_layer):
-    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoECutlassMethod
-    from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
-    # if isinstance(moe_layer.quant_method, CompressedTensorsW8A8Fp8MoECutlassMethod):
     with torch.no_grad():
         # Initialize weights. Note: float8 types don't have normal_ but we can
         # create in float32 and cast.
         moe_layer.w13_weight.copy_(
-            torch.randn_like(moe_layer.w13_weight, dtype=torch.float32))
+            torch.randn_like(moe_layer.w13_weight, dtype=torch.float32).to(moe_layer.w13_weight.dtype),
+        )
         moe_layer.w2_weight.copy_(
-            torch.randn_like(moe_layer.w2_weight, dtype=torch.float32))
+            torch.randn_like(moe_layer.w2_weight, dtype=torch.float32).to(moe_layer.w2_weight.dtype),
+        )
 
         # Initialize scales with random values around 1.0
         # These checks ensure we only initialize parameters that were created.
@@ -290,14 +289,35 @@ def init_moe_weight(moe_layer):
                 
                 if hasattr(moe_layer, "w2_input_scale") and moe_layer.w2_input_scale is not None:
                     moe_layer.w2_input_scale.uniform_(0.9, 1.1)
-    # elif isinstance(moe_layer.quant_method, UnquantizedFusedMoEMethod):
+
+def init_linear_weight(linear_layer):
+    with torch.no_grad():
+        # Initialize weights. Note: float8 types don't have normal_ but we can
+        # create in float32 and cast.
+        linear_layer.weight.copy_(
+            torch.randn_like(linear_layer.weight, dtype=torch.float32).to(linear_layer.weight.dtype),
+        )
+
+        # Initialize scales with random values around 1.0
+        # These checks ensure we only initialize parameters that were created.
+        if hasattr(linear_layer, "input_scale") and linear_layer.input_scale is not None:
+            linear_layer.input_scale.uniform_(0.9, 1.1)
+        else:
+            linear_layer.input_scale = None
+
+        if hasattr(linear_layer, "weight_scale") and linear_layer.weight_scale is not None:
+            linear_layer.weight_scale.uniform_(0.9, 1.1)
+
+        if hasattr(linear_layer, "scheme"):
+            # out dtype should be bfloat16 even for fp8, FIXME fp8 linear has some problem
+            linear_layer.scheme.out_dtype = torch.bfloat16
 
 
 def test_allclose(tensor1, tensor2, threshold_map=None):
     if threshold_map is None:
         threshold_map = {
             torch.float16: 1e-2,
-            torch.bfloat16: 7e-2, # torch.bfloat16: 2e-2,
+            torch.bfloat16: 2e-2, 
             torch.float8_e4m3fn: 3e-2,
             torch.float8_e5m2: 3e-2,
             torch.int8: 2e-1,
@@ -374,12 +394,12 @@ def vllm_forward(args,
     # print_rank0(f'parllel? {o_proj.input_is_parallel}, in {o_proj.input_size_per_partition}, out {o_proj.output_size_per_partition}, reduce {o_proj.reduce_results}')
 
     proj_out, _ = o_proj(attn_out)  # applied all-reduce
-    print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
+    # print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
     # print_rank0(f'{o_proj.weight}, {attn_out}, {proj_out}')
 
     clone = proj_out.clone()
     vllm_out = vllm_moe_layer(clone, router_logits) # XXX moe will modify in place
-    print_rank0(f'vllm_out: {vllm_out.shape}')
+    # print_rank0(f'vllm_out: {vllm_out.shape}')
     return None, proj_out, vllm_out
 
 @torch.no_grad()
@@ -403,7 +423,7 @@ def breakdown_forward(args,
     ## RS+AG
     rs_out = tensor_model_parallel_reduce_scatter(partial_out,0)
     proj_out = tensor_model_parallel_all_gather(rs_out,0)
-    print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
+    # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
 
     ## RS+AG (high precision)
     # rs_out = tensor_model_parallel_reduce_scatter(partial_out.float(),0)
@@ -424,7 +444,7 @@ def breakdown_forward(args,
 
     clone = proj_out.clone()
     vllm_out = vllm_moe_layer(clone, router_logits)
-    print_rank0(f'vllm_out: {vllm_out.shape}')
+    # print_rank0(f'vllm_out: {vllm_out.shape}')
     return rs_out, proj_out, vllm_out
 
 
@@ -458,8 +478,7 @@ def flux_forward(args,
     is_fp8 = flux.util.is_fp8_dtype(attn_out.dtype)
     is_s8_dequant = attn_out.dtype == torch.int8
     output_dtype = torch.bfloat16 if is_fp8 or is_s8_dequant else attn_out.dtype
-
-    print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
+    # print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
     dist.barrier()
 
     gemm_rs_op = flux.GemmRS(
@@ -483,13 +502,18 @@ def flux_forward(args,
         fast_accum=False,
         reduce_scatter_option=reduce_scatter_option,
     )
-    print_rank0(f'gemm RS out: {rs_out.shape}')
+    # print_rank0(f'gemm RS out: {rs_out.shape}')
 
-    # all-gather 
+    # unfused
+    proj_out = tensor_model_parallel_all_gather(rs_out,0)
+    clone = proj_out.clone()
+    vllm_out = vllm_moe_layer(clone, router_logits)
 
-    # FusedMoE_
+    # fused 
+    # fused moe-layer0 (AG + GroupGEMM)
+    ## moe-layer1 
 
-    return rs_out, None, None
+    return rs_out, proj_out, vllm_out
 
 def main():
     args = parse_args()
@@ -586,10 +610,14 @@ def main():
         args.hidden_size,  # out
         bias=False,
         params_dtype=dtype,
-        quant_config=None, # quant_config=quant_config,
+
+        # TODO fp8 linear has some problem
+        # quant_config=quant_config if args.quant else None, 
     ).to(device)
-    with torch.no_grad():
-        o_proj.weight.data.uniform_(0, 1)
+    init_linear_weight(o_proj)
+    # print_rank0(f'[MoE] {vllm_moe_layer.w13_weight.shape} {vllm_moe_layer.w13_weight.dtype}')
+    # print_rank0(f'[Linear] {o_proj.weight.shape}, {o_proj.weight.dtype}, {o_proj.weight_scale.shape} {o_proj.weight_scale.dtype}')
+    # print_rank0(f'{o_proj.scheme.out_dtype}, {o_proj.scheme}')
     dist.barrier()
 
     # forward
