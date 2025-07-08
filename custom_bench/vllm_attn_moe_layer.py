@@ -463,8 +463,8 @@ def prepare_rs(args):
     return reduce_scatter_option
 
 @torch.no_grad()
-def flux_forward(args,
-                o_proj, vllm_moe_layer,
+def gemm_rs_moe_forward(args,
+                o_proj, vllm_moe_layer: FusedMoE,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
             ):
@@ -505,15 +505,106 @@ def flux_forward(args,
     # print_rank0(f'gemm RS out: {rs_out.shape}')
 
     # unfused
+    # proj_out = tensor_model_parallel_all_gather(rs_out,0)
+    # clone = proj_out.clone()
+    # vllm_out = vllm_moe_layer(clone, router_logits)
+
+    # unfused - breakdown
     proj_out = tensor_model_parallel_all_gather(rs_out,0)
     clone = proj_out.clone()
-    vllm_out = vllm_moe_layer(clone, router_logits)
+    topk_weights, topk_ids = vllm_moe_layer.select_experts(
+        hidden_states=clone,
+        router_logits=router_logits,
+        use_grouped_topk=vllm_moe_layer.use_grouped_topk,
+        top_k=vllm_moe_layer.top_k,
+        renormalize=vllm_moe_layer.renormalize,
+        topk_group=vllm_moe_layer.topk_group,
+        num_expert_group=vllm_moe_layer.num_expert_group,
+        custom_routing_function=vllm_moe_layer.custom_routing_function,
+        scoring_func=vllm_moe_layer.scoring_func,
+        e_score_correction_bias=vllm_moe_layer.e_score_correction_bias,
+        indices_type=torch.uint32,
+    )
+    dtype = vllm_moe_layer.w13_weight.dtype
+    if dtype == torch.bfloat16:
+        vllm_out = vllm_moe_layer.quant_method.fused_experts(
+            clone,
+            vllm_moe_layer.w13_weight,
+            vllm_moe_layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            inplace=True,
+            activation=vllm_moe_layer.activation,
+            apply_router_weight_on_input=vllm_moe_layer.apply_router_weight_on_input,
+            global_num_experts=vllm_moe_layer.global_num_experts,
+            expert_map=vllm_moe_layer.expert_map,
+        )
+    elif dtype == torch.float8_e4m3fn:
+        vllm_out = vllm_moe_layer.quant_method.fused_experts(
+                clone,
+                vllm_moe_layer.w13_weight,
+                vllm_moe_layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                activation=vllm_moe_layer.activation,
+                global_num_experts=vllm_moe_layer.global_num_experts,
+                expert_map=vllm_moe_layer.expert_map,
+                w1_scale=vllm_moe_layer.w13_weight_scale,
+                w2_scale=vllm_moe_layer.w2_weight_scale,
+                a1_scale=vllm_moe_layer.w13_input_scale,
+                a2_scale=vllm_moe_layer.w2_input_scale,
+        )
+    else:
+        raise
+    return rs_out, proj_out, vllm_out
 
+@torch.no_grad()
+def flux_forward(args,
+                o_proj, vllm_moe_layer: FusedMoE,
+                hidden_size_per_tp, router_logits,
+                q, k, v, out, 
+            ):
+    attn_out = out.view(-1, hidden_size_per_tp)
+
+    # reduce-scatter + GEMM
+    reduce_scatter_option = prepare_rs(args)
+    tp_process_group = get_tp_group().device_group
+    M = attn_out.size(0) # in 
+    N = args.hidden_size # out
+    is_fp8 = flux.util.is_fp8_dtype(attn_out.dtype)
+    is_s8_dequant = attn_out.dtype == torch.int8
+    output_dtype = torch.bfloat16 if is_fp8 or is_s8_dequant else attn_out.dtype
+    # print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
+    dist.barrier()
+
+    gemm_rs_op = flux.GemmRS(
+        tp_process_group,
+        1,  # NNODE
+        (M + 1024 - 1) // 1024 * 1024,
+        N,
+        attn_out.dtype,
+        output_dtype,
+        transpose_weight=args.transpose_weight,
+        fuse_reduction=args.fuse_reduction,
+        ring_reduction=args.ring_reduction,
+    )
+    rs_out = gemm_rs_op.forward(
+        attn_out,
+        o_proj.weight,
+        bias=None,
+        input_scale=None,
+        weight_scale=None,
+        output_scale=None,
+        fast_accum=False,
+        reduce_scatter_option=reduce_scatter_option,
+    )
+    # print_rank0(f'gemm RS out: {rs_out.shape}')
     # fused 
     # fused moe-layer0 (AG + GroupGEMM)
     ## moe-layer1 
 
-    return rs_out, proj_out, vllm_out
+    return rs_out, None, None
+
 
 def main():
     args = parse_args()
@@ -635,6 +726,10 @@ def main():
         fa_version=fa_version,
         q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
     )
+    # vllm - breakdown
+    print_rank0('=='*10 + 'vLLM - breakdown' + '=='*10)
+    results = {}
+    names = ['rs_out','proj_out', 'moe_out']
     vllm_outs = vllm_forward(args,
                 o_proj, vllm_moe_layer,
                 hidden_size_per_tp, router_logits,
@@ -645,33 +740,28 @@ def main():
                 hidden_size_per_tp, router_logits,
                 q, k, v, out,
             )
-    names = ['rs_out','proj_out', 'moe_out']
-    results = {}
     for name, vllm_out, break_out in zip(names, vllm_outs, breakdown_outs):
         test_tensors(vllm_out, break_out, name, results)
-
         # if name == 'proj_out':
         #     print_rank0(vllm_out)
         #     print_rank0(break_out)
         # print_rank0(vllm_out)
         # print_rank0(break_out)
     test_results(results)
+    dist.barrier()
 
-    flux_outs = flux_forward(args,
+    # gemmRS - breakdown
+    print_rank0('=='*10 + 'gemmRS_moe - breakdown' + '=='*10)
+    results = {}
+    gemmRS_outs = gemm_rs_moe_forward(args,
                  o_proj, vllm_moe_layer,
                  hidden_size_per_tp, router_logits,
                  q, k, v, out, 
                 )
-    results = {}
-    for name, break_out, flux_out in zip(names, breakdown_outs, flux_outs):
-        test_tensors(flux_out, break_out, name, results)
-
-        if name == 'proj_out':
-            print_rank0(flux_out)
-            print_rank0(break_out)
-        # print_rank0(vllm_out)
-        # print_rank0(break_out)
+    for name, break_out, out in zip(names, breakdown_outs, gemmRS_outs):
+        test_tensors(out, break_out, name, results)
     test_results(results)
+    dist.barrier()
 
     # results = {}
     # for name, vllm_out, flux_out in zip(names, vllm_outs, flux_outs):
