@@ -20,6 +20,10 @@ from vllm.config import get_current_vllm_config
 from vllm.platforms import current_platform
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
+from vllm.triton_utils import tl
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import moe_align_block_size
+from vllm import _custom_ops as ops
 
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -448,19 +452,136 @@ def breakdown_forward(args,
     return rs_out, proj_out, vllm_out
 
 
-def prepare_rs(args):
-    reduce_scatter_option = ReduceScatterOption()
-    reduce_scatter_option.use_1d_ring = args.use_1d_ring
-    reduce_scatter_option.use_p2p_read = args.use_p2p_read
-    reduce_scatter_option.use_cudaMemcpyAsync = args.use_cudaMemcpyAsync
-    reduce_scatter_option.use_gemmk = args.use_gemmk
-    reduce_scatter_option.per_tile_flags = args.per_tile_flags
-    reduce_scatter_option.num_blocks = args.reduce_scatter_blocks
-    reduce_scatter_option.ring_mode = {
-        "ring1d": flux.RingMode.Ring1D,
-        "ring2d": flux.RingMode.Ring2D,
-    }.get(args.ring_mode, None)
-    return reduce_scatter_option
+def _bf16_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str = "silu",
+    global_num_experts: int = -1,
+):
+    from vllm.model_executor.layers.fused_moe.fused_moe import invoke_fused_moe_kernel
+    assert hidden_states.dtype == torch.bfloat16
+
+    num_tokens = hidden_states.shape[0]
+    E, N, _ = w1.shape
+    K = w2.shape[1]
+    if global_num_experts == -1:
+        global_num_experts = E
+    top_k_num = topk_ids.shape[1]
+    # We execute the fused_moe kernel in chunks to circumvent this issue:
+    # https://github.com/vllm-project/vllm/issues/5938
+    CHUNK_SIZE = 65536
+    M = min(num_tokens, CHUNK_SIZE)
+    config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
+
+    # do not REUSE
+    intermediate_cache1 = torch.empty((M, top_k_num, N),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+    intermediate_cache3 = torch.empty((M, top_k_num, K),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+
+    intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+
+    apply_router_weight_on_input  = False 
+    compute_type = tl.bfloat16
+    out_hidden_states = torch.empty_like(hidden_states)
+
+    for chunk in range((num_tokens // CHUNK_SIZE) + 1):
+        begin_chunk_idx, end_chunk_idx = (chunk * CHUNK_SIZE,
+                                          min((chunk + 1) * CHUNK_SIZE,
+                                              num_tokens))
+        curr_hidden_states = hidden_states[begin_chunk_idx:end_chunk_idx]
+        tokens_in_chunk, _ = curr_hidden_states.shape
+
+        if tokens_in_chunk == 0:
+            break
+
+        if tokens_in_chunk < CHUNK_SIZE and chunk > 0:
+            # Adjust the intermediate cache size and config for the last
+            # chunk. Note that in most cases we only have one chunk
+            # so the cache size and config are already set correctly and
+            # do not need to be adjusted.
+            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
+            intermediate_cache2 = intermediate_cache2[:tokens_in_chunk *
+                                                      topk_ids.shape[1]]
+            intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
+            # config = get_config_func(tokens_in_chunk)
+
+        curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
+        curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+
+        qcurr_hidden_states, a1q_scale = curr_hidden_states, None
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
+                                 global_num_experts, expert_map=None))
+
+        invoke_fused_moe_kernel(qcurr_hidden_states,
+                                w1,
+                                intermediate_cache1,
+                                a1q_scale,
+                                None,
+                                None,
+                                curr_topk_weights,
+                                sorted_token_ids,
+                                expert_ids,
+                                num_tokens_post_padded,
+                                apply_router_weight_on_input,
+                                top_k_num,
+                                config,
+                                compute_type=compute_type,
+                                use_fp8_w8a8=False,
+                                use_int8_w8a8=False,
+                                use_int8_w8a16=False,
+                                use_int4_w4a16=False,
+                                per_channel_quant=False,
+                                block_shape=None)
+
+        if activation == "silu":
+            torch.ops._C.silu_and_mul(intermediate_cache2,
+                                      intermediate_cache1.view(-1, N))
+        elif activation == "gelu":
+            torch.ops._C.gelu_and_mul(intermediate_cache2,
+                                      intermediate_cache1.view(-1, N))
+        else:
+            raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+        qintermediate_cache2, a2q_scale = intermediate_cache2, None
+        invoke_fused_moe_kernel(qintermediate_cache2,
+                                w2,
+                                intermediate_cache3,
+                                a2q_scale,
+                                None,
+                                None,
+                                curr_topk_weights,
+                                sorted_token_ids,
+                                expert_ids,
+                                num_tokens_post_padded,
+                                not apply_router_weight_on_input,
+                                1,
+                                config,
+                                compute_type=compute_type,
+                                use_fp8_w8a8=False,
+                                use_int8_w8a8=False,
+                                use_int8_w8a16=False,
+                                use_int4_w4a16=False,
+                                per_channel_quant=False,
+                                block_shape=None)
+
+        ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states[begin_chunk_idx:end_chunk_idx])
+
+    assert chunk == 0, 'we only want 1 step now'
+    return intermediate_cache1, intermediate_cache2, intermediate_cache3, out_hidden_states
+
+def _fp8_moe():
+    return 
 
 @torch.no_grad()
 def gemm_rs_moe_forward(args,
@@ -504,42 +625,28 @@ def gemm_rs_moe_forward(args,
     )
     # print_rank0(f'gemm RS out: {rs_out.shape}')
 
-    # unfused
-    # proj_out = tensor_model_parallel_all_gather(rs_out,0)
-    # clone = proj_out.clone()
-    # vllm_out = vllm_moe_layer(clone, router_logits)
-
-    # unfused - breakdown
     proj_out = tensor_model_parallel_all_gather(rs_out,0)
     clone = proj_out.clone()
-    topk_weights, topk_ids = vllm_moe_layer.select_experts(
-        hidden_states=clone,
-        router_logits=router_logits,
-        use_grouped_topk=vllm_moe_layer.use_grouped_topk,
-        top_k=vllm_moe_layer.top_k,
+    topk_weights, topk_ids, token_expert_indices = fused_topk(
+        clone,
+        gating_output=router_logits,
+        topk=vllm_moe_layer.top_k,
         renormalize=vllm_moe_layer.renormalize,
-        topk_group=vllm_moe_layer.topk_group,
-        num_expert_group=vllm_moe_layer.num_expert_group,
-        custom_routing_function=vllm_moe_layer.custom_routing_function,
-        scoring_func=vllm_moe_layer.scoring_func,
-        e_score_correction_bias=vllm_moe_layer.e_score_correction_bias,
         indices_type=torch.uint32,
     )
+
     dtype = vllm_moe_layer.w13_weight.dtype
     if dtype == torch.bfloat16:
-        vllm_out = vllm_moe_layer.quant_method.fused_experts(
-            clone,
+        c1, c2, c3, vllm_out = _bf16_moe(clone, 
             vllm_moe_layer.w13_weight,
             vllm_moe_layer.w2_weight,
             topk_weights,
             topk_ids,
-            inplace=True,
             activation=vllm_moe_layer.activation,
-            apply_router_weight_on_input=vllm_moe_layer.apply_router_weight_on_input,
             global_num_experts=vllm_moe_layer.global_num_experts,
-            expert_map=vllm_moe_layer.expert_map,
         )
     elif dtype == torch.float8_e4m3fn:
+        # TODO breakdown
         vllm_out = vllm_moe_layer.quant_method.fused_experts(
                 clone,
                 vllm_moe_layer.w13_weight,
@@ -555,8 +662,28 @@ def gemm_rs_moe_forward(args,
                 a2_scale=vllm_moe_layer.w2_input_scale,
         )
     else:
-        raise
-    return rs_out, proj_out, vllm_out
+        raise   
+    
+    vllm_out = tensor_model_parallel_all_reduce(vllm_out)
+    print_rank0(f'MOE - w13: {vllm_moe_layer.w13_weight.shape}, w2: {vllm_moe_layer.w2_weight.shape}')
+    print_rank0(f'MOE - c1: {c1.shape}, c2: {c2.shape}, c3: {c3.shape}, vllm_out: {vllm_out.shape}')
+    return rs_out, proj_out, vllm_out, c1, c2, c3
+
+
+def prepare_rs(args):
+    reduce_scatter_option = ReduceScatterOption()
+    reduce_scatter_option.use_1d_ring = args.use_1d_ring
+    reduce_scatter_option.use_p2p_read = args.use_p2p_read
+    reduce_scatter_option.use_cudaMemcpyAsync = args.use_cudaMemcpyAsync
+    reduce_scatter_option.use_gemmk = args.use_gemmk
+    reduce_scatter_option.per_tile_flags = args.per_tile_flags
+    reduce_scatter_option.num_blocks = args.reduce_scatter_blocks
+    reduce_scatter_option.ring_mode = {
+        "ring1d": flux.RingMode.Ring1D,
+        "ring2d": flux.RingMode.Ring2D,
+    }.get(args.ring_mode, None)
+    return reduce_scatter_option
+
 
 @torch.no_grad()
 def flux_forward(args,
@@ -599,9 +726,44 @@ def flux_forward(args,
         reduce_scatter_option=reduce_scatter_option,
     )
     # print_rank0(f'gemm RS out: {rs_out.shape}')
-    # fused 
+
+    # TODO this can be skip; see the fused_topk, but use for convenience
+    out = tensor_model_parallel_all_gather(rs_out,0)
+    topk_weights, topk_ids, token_expert_indices = fused_topk(
+        out,
+        gating_output=router_logits,
+        topk=vllm_moe_layer.top_k,
+        renormalize=vllm_moe_layer.renormalize,
+        indices_type=torch.uint32,
+    )
+
+    # moe_args = flux.MoeArguments(
+    #     max_ntokens=ctx.b * ctx.s,
+    #     hidden=ctx.h,
+    #     ffn_hidden=ctx.ffn_size,
+    #     nexperts=ctx.nexperts,
+    #     topk=ctx.topk,
+    #     input_dtype=ctx.inputs_shard.dtype,
+    #     output_dtype=ctx.outputs[0].dtype,
+    # )
+    # extra_args = {}
+    # op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
+    # op.clear_buffers()
+    # op.forward(
+    #     inputs_shard=ctx.inputs_shard,
+    #     weights=ctx.weights[0],
+    #     splits_gpu=ctx.splits_gpu,
+    #     scatter_index=ctx.scatter_index,
+    #     output_scale=ctx.output_scale[0],
+    #     outputs_buf=ctx.outputs[0],
+    #     fast_accum=ctx.fast_accum,
+    #     sm_margin=args.sm_margin,
+    #     allgather_output=gathered_input,
+    #     **extra_args,
+    # )
+    # c1 = ...
+
     # fused moe-layer0 (AG + GroupGEMM)
-    ## moe-layer1 
 
     return rs_out, None, None
 
@@ -663,7 +825,6 @@ def main():
                 tp_size=args.tp_size,
             )
     # torch.distributed.breakpoint(0)
-
     dist.barrier()
 
     # model
@@ -684,11 +845,11 @@ def main():
                             hidden_size=args.hidden_size,
                             intermediate_size=args.intermediate_size,
                             params_dtype=torch.bfloat16,  # input is bf16, but quant will apply to weights
-                            # reduce_results=True,
-                            # renormalize=True,
+                            reduce_results=True,
+                            renormalize=True,
                             #
-                            quant_config=quant_config if args.quant else None, # quant default is bf16
                             # quant_config=None,  
+                            quant_config=quant_config if args.quant else None, # quant default is bf16
 
                             # tp_size=args.tp_size,
                             # prefix=f"experts",
@@ -706,8 +867,8 @@ def main():
         # quant_config=quant_config if args.quant else None, 
     ).to(device)
     init_linear_weight(o_proj)
-    # print_rank0(f'[MoE] {vllm_moe_layer.w13_weight.shape} {vllm_moe_layer.w13_weight.dtype}')
-    # print_rank0(f'[Linear] {o_proj.weight.shape}, {o_proj.weight.dtype}, {o_proj.weight_scale.shape} {o_proj.weight_scale.dtype}')
+    print_rank0(f'[MoE] {vllm_moe_layer.w13_weight.shape} {vllm_moe_layer.w13_weight.dtype}')
+    print_rank0(f'[Linear] {o_proj.weight.shape}, {o_proj.weight.dtype}')
     # print_rank0(f'{o_proj.scheme.out_dtype}, {o_proj.scheme}')
     dist.barrier()
 
@@ -763,12 +924,18 @@ def main():
     test_results(results)
     dist.barrier()
 
+    # print_rank0('=='*10 + 'flux - gemmRS' + '=='*10)
     # results = {}
-    # for name, vllm_out, flux_out in zip(names, vllm_outs, flux_outs):
-    #     test_tensors(vllm_out, flux_out, name, results)
-    # for output_name, is_close in results.items():
-    #     status = "✅ PASS" if is_close else "❌ FAIL"
-    #     print(f"  {output_name}: {status}")
+    # flux_outs = flux_forward(args,
+    #              o_proj, vllm_moe_layer,
+    #              hidden_size_per_tp, router_logits,
+    #              q, k, v, out, 
+    #             )
+    # names = ['rs_out','proj_out', 'moe_out', 'c1', 'c2', 'c3']
+    # for name, out1, out2 in zip(names, gemmRS_outs, flux_outs):
+    #     test_tensors(out1, out2, name, results)
+    # test_results(results)
+    # dist.barrier()
 
     # bench
     # quantiles = [0.5, 0.2, 0.8]
