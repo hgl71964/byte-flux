@@ -4,5 +4,9 @@
         "/root/repos/pytorch",
         "/root/repos/triton/python",
         "python"
-    ]
+    ],
+    "files.associations": {
+        "optional": "cpp",
+        "iosfwd": "cpp"
+    }
 }
