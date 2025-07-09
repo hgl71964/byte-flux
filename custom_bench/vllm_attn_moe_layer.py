@@ -755,7 +755,6 @@ def flux_forward(args,
     is_s8_dequant = attn_out.dtype == torch.int8
     output_dtype = torch.bfloat16 if is_fp8 or is_s8_dequant else attn_out.dtype
     # print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
-    dist.barrier()
 
     gemm_rs_op = flux.GemmRS(
         tp_process_group,
@@ -805,11 +804,10 @@ def flux_forward(args,
     global EP_GROUP
     tp_env = flux.DistEnvTPWithEP(tp_group=get_tp_group().device_group, nnodes=1, ep_group=EP_GROUP)
     ag_moe_op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
-
     # print_rank0(moe_args.ffn_hidden)
-    print_rank0(tp_env)
+    # print_rank0(tp_env)
     ag_moe_op.clear_buffers()
-    dist.barrier()
+    ag_out = torch.empty_like(clone)
     c1 = ag_moe_op.forward(
         inputs_shard=rs_out,
         weights=vllm_moe_layer.w13_weight,
@@ -819,11 +817,11 @@ def flux_forward(args,
         sm_margin=args.sm_margin,
         output_scale=None,
         outputs_buf=None,
-        allgather_output=None,
+        allgather_output=ag_out,
         **extra_args,
     )
-
-    return rs_out, None, None, topk_weights, topk_ids.int(), c1.reshape(M, args.topk, -1), None, None
+    return rs_out, ag_out, None, topk_weights, topk_ids.int(), \
+        c1.reshape(M, args.topk, -1), None, None
 
 
 def main():
