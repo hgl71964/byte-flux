@@ -1,5 +1,9 @@
 # NVSHMEM_DISABLE_CUDA_VMM=1 torchrun --nproc_per_node=4 custom_bench/vllm_attn_moe_layer.py --tp_size 4
 
+# NOTE: NCCL accumulates at bf16 introduces numerical issue
+# we can use stable reduction algo - eliminates the numerical issue - however FLUX does not support that
+# NCCL_ALGO=tree,NVLSTree,NVLS  NVSHMEM_DISABLE_CUDA_VMM=1 torchrun --nproc_per_node=4 custom_bench/vllm_attn_moe_layer.py --tp_size 4
+
 import os
 from typing import Optional, Callable, Tuple, List
 from copy import deepcopy
@@ -820,8 +824,16 @@ def flux_forward(args,
         allgather_output=ag_out,
         **extra_args,
     )
+
+    # unpermute c1
+    c1_unpermute = torch.zeros(M, args.topk, vllm_moe_layer.w13_weight.shape[1], dtype=clone.dtype, device=clone.device)
+    for i in range(M):
+        indices = scatter_index[i]
+        c1_unpermute[i] = c1[indices]
+        # print_rank0(c1_unpermute[i].shape, c1[indices].shape, indices)
+
     return rs_out, ag_out, None, topk_weights, topk_ids.int(), \
-        c1.reshape(M, args.topk, -1), None, None
+        c1_unpermute, None, None
 
 
 def main():

@@ -96,6 +96,7 @@ class MoeMlp1Ctx:
         # print(moe_gating_args.choosed_experts)
         # print(moe_gating_args.choosed_experts.max())
 
+        self.choosed_experts = moe_gating_args.choosed_experts
         self.splits_gpu = moe_gating_args.splits_gpu
         self.splits_cpu = moe_gating_args.splits_gpu.to("cpu")
         self.scatter_index = moe_gating_args.scatter_index
