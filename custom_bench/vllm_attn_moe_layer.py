@@ -203,7 +203,6 @@ def token_choice_with_bias(hidden_states: torch.Tensor,
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
-
 # def init_worker_distributed_environment(
 #     parallel_config,
 #     rank: int,
@@ -439,8 +438,7 @@ def vllm_forward(args,
     # print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
     # print_rank0(f'{o_proj.weight}, {attn_out}, {proj_out}')
 
-    clone = proj_out.clone()
-    vllm_out = vllm_moe_layer(clone, router_logits) # XXX moe will modify in place
+    vllm_out = vllm_moe_layer(proj_out.clone(), router_logits) # NOTE: inplace
     # print_rank0(f'vllm_out: {vllm_out.shape}')
     return None, proj_out, vllm_out
 
@@ -484,8 +482,7 @@ def breakdown_forward(args,
     # dist.all_gather_into_tensor(proj_out, rs_out, group=tp_group)
     # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape}')
 
-    clone = proj_out.clone()
-    vllm_out = vllm_moe_layer(clone, router_logits)
+    vllm_out = vllm_moe_layer(proj_out.clone(), router_logits)
     # print_rank0(f'vllm_out: {vllm_out.shape}')
     return rs_out, proj_out, vllm_out
 
@@ -513,20 +510,19 @@ def _bf16_moe(
     CHUNK_SIZE = 65536
     M = min(num_tokens, CHUNK_SIZE)
     config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
+    # print_rank0(f'w1: {w1.shape}, w2: {w2.shape}, {M}, {top_k_num}, {N}, {K}')
 
     # do not REUSE
     intermediate_cache1 = torch.empty((M, top_k_num, N),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-    intermediate_cache3 = torch.empty((M, top_k_num, K),
-                                      device=hidden_states.device,
-                                      dtype=hidden_states.dtype)
-
     intermediate_cache2 = torch.empty((M * top_k_num, N // 2),
                                       device=hidden_states.device,
                                       dtype=hidden_states.dtype)
-
-    apply_router_weight_on_input = False 
+    intermediate_cache3 = torch.empty((M, top_k_num, K),
+                                      device=hidden_states.device,
+                                      dtype=hidden_states.dtype)
+    apply_router_weight_on_input = False
     compute_type = tl.bfloat16
     out_hidden_states = torch.empty_like(hidden_states)
 
@@ -601,7 +597,9 @@ def _bf16_moe(
                                 sorted_token_ids,
                                 expert_ids,
                                 num_tokens_post_padded,
-                                not apply_router_weight_on_input,
+                                # FIXME flux does not support in-kernel accumuldation yet
+                                # default: not apply_router_weight_on_input, -> True
+                                apply_router_weight_on_input,
                                 1,
                                 config,
                                 compute_type=compute_type,
@@ -663,10 +661,9 @@ def gemm_rs_moe_forward(args,
     )
 
     proj_out = tensor_model_parallel_all_gather(rs_out,0)
-    clone = proj_out.clone()
     # print_rank0(rs_out.shape, clone.shape, router_logits.shape)
     topk_weights, topk_ids, token_expert_indices = fused_topk(
-        clone,
+        proj_out,
         gating_output=router_logits,
         topk=vllm_moe_layer.top_k,
         renormalize=vllm_moe_layer.renormalize,
@@ -685,17 +682,17 @@ def gemm_rs_moe_forward(args,
 
     dtype = vllm_moe_layer.w13_weight.dtype
     if dtype == torch.bfloat16:
-        c1, c2, c3, vllm_out = _bf16_moe(clone, 
+        c1, c2, c3, partial_vllm_out = _bf16_moe(proj_out, 
             vllm_moe_layer.w13_weight,
             vllm_moe_layer.w2_weight,
             topk_weights,
             topk_ids,
-            activation=vllm_moe_layer.activation,
+            activation='silu',  # vllm_moe_layer.activation
             global_num_experts=vllm_moe_layer.global_num_experts,
         )
     elif dtype == torch.float8_e4m3fn:
         # TODO breakdown
-        vllm_out = vllm_moe_layer.quant_method.fused_experts(
+        partial_vllm_out = vllm_moe_layer.quant_method.fused_experts(
                 clone,
                 vllm_moe_layer.w13_weight,
                 vllm_moe_layer.w2_weight,
@@ -711,11 +708,14 @@ def gemm_rs_moe_forward(args,
         )
     else:
         raise   
-    
-    vllm_out = tensor_model_parallel_all_reduce(vllm_out)
+    # RS+AG
+    rs_MoE = tensor_model_parallel_reduce_scatter(partial_vllm_out,0)
+    vllm_out = tensor_model_parallel_all_gather(rs_MoE,0)
+    # AR
+    # vllm_out = tensor_model_parallel_all_reduce(partial_vllm_out)
     print_rank0(f'MOE - w13: {vllm_moe_layer.w13_weight.shape}, w2: {vllm_moe_layer.w2_weight.shape}')
-    print_rank0(f'MOE - c1: {c1.shape}, c2: {c2.shape}, c3: {c3.shape}, vllm_out: {vllm_out.shape}')
-    return rs_out, proj_out, vllm_out, topk_weights, topk_ids.int(), c1, c2, c3
+    print_rank0(f'MOE - inter_cache1: {c1.shape}, inter_cache2: {c2.shape}, inter_cache3: {c3.shape}, vllm_out: {vllm_out.shape}')
+    return rs_out, proj_out, vllm_out, topk_weights, topk_ids.int(), c1, c2, c3, partial_vllm_out, rs_MoE
 
 
 def prepare_rs(args):
@@ -743,28 +743,37 @@ def prepare_scatter_index_split_gpu(topk_ids, num_experts):
 
 
 @torch.no_grad()
-def flux_forward(args,
+def gemmRS_AGmoe_forward(args,
                 o_proj, vllm_moe_layer: FusedMoE,
                 hidden_size_per_tp, router_logits,
                 q, k, v, out, 
             ):
     attn_out = out.view(-1, hidden_size_per_tp)
 
-    # reduce-scatter + GEMM
-    reduce_scatter_option = prepare_rs(args)
-    tp_process_group = get_tp_group().device_group
+    # PREP
     M = attn_out.size(0) # in 
-    N = args.hidden_size # out
+    hidden_size = args.hidden_size # out
+    E, N, _K = vllm_moe_layer.w13_weight.shape
+    K = vllm_moe_layer.w2_weight.shape[1]
+    assert K == _K
+    tp_process_group = get_tp_group().device_group
+
+    intermediate_cache1 = torch.zeros(M, args.topk, N, dtype=attn_out.dtype, device=attn_out.device)
+    intermediate_cache2 = torch.empty((M * args.topk, N // 2), device=attn_out.device, dtype=attn_out.dtype)
+    intermediate_cache3 = torch.empty((M, args.topk, K), device=attn_out.device, dtype=attn_out.dtype)
+
     is_fp8 = flux.util.is_fp8_dtype(attn_out.dtype)
     is_s8_dequant = attn_out.dtype == torch.int8
     output_dtype = torch.bfloat16 if is_fp8 or is_s8_dequant else attn_out.dtype
     # print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
 
+    # OUT_PROJECT
+    reduce_scatter_option = prepare_rs(args)
     gemm_rs_op = flux.GemmRS(
         tp_process_group,
         1,  # NNODE
         (M + 1024 - 1) // 1024 * 1024,
-        N,
+        hidden_size,
         attn_out.dtype,
         output_dtype,
         transpose_weight=args.transpose_weight,
@@ -781,37 +790,162 @@ def flux_forward(args,
         fast_accum=False,
         reduce_scatter_option=reduce_scatter_option,
     )
+
+    # ROUTER
     # TODO this can be skip; see the fused_topk, but use for convenience
-    clone = tensor_model_parallel_all_gather(rs_out,0)
-    # print_rank0(rs_out.shape,clone.shape, router_logits.shape)
+    proj_out = tensor_model_parallel_all_gather(rs_out,0)
+    # print_rank0(rs_out.shape,proj_out.shape, router_logits.shape)
     topk_weights, topk_ids, token_expert_indices = fused_topk(
-        clone,
+        proj_out,
         gating_output=router_logits,
         topk=vllm_moe_layer.top_k,
         renormalize=vllm_moe_layer.renormalize,
         indices_type=torch.uint32,
     )
-    choosed_experts, scatter_index, splits_gpu = prepare_scatter_index_split_gpu(topk_ids, args.num_experts)
+    choosed_experts, scatter_index, splits_gpu = prepare_scatter_index_split_gpu(topk_ids, E)
 
-    input_dtype = clone.dtype
+    # MOE0
+    input_dtype = rs_out.dtype
     output_dtype = torch.bfloat16 if is_fp8 else input_dtype
     moe_args = flux.MoeArguments(
         max_ntokens=args.batch_size * args.seq_len,
-        hidden=args.hidden_size,
+        hidden=hidden_size,
         ffn_hidden=args.intermediate_size * 2,  # FuseMoE's layer 0 doubles this, then act reduce by half
-        nexperts=args.num_experts,
+        nexperts=E,
         topk=args.topk,
         input_dtype=input_dtype,
         output_dtype=output_dtype,
     )
     extra_args = {}
     global EP_GROUP
-    tp_env = flux.DistEnvTPWithEP(tp_group=get_tp_group().device_group, nnodes=1, ep_group=EP_GROUP)
+    tp_env = flux.DistEnvTPWithEP(tp_group=tp_process_group, nnodes=1, ep_group=EP_GROUP)
     ag_moe_op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
-    # print_rank0(moe_args.ffn_hidden)
-    # print_rank0(tp_env)
     ag_moe_op.clear_buffers()
-    ag_out = torch.empty_like(clone)
+    ag_out = torch.empty_like(proj_out)
+    c1 = ag_moe_op.forward(
+        inputs_shard=rs_out,
+        weights=vllm_moe_layer.w13_weight,
+        splits_gpu=splits_gpu,
+        scatter_index=scatter_index,
+        fast_accum=args.fast_accum,
+        sm_margin=args.sm_margin,
+        output_scale=None,
+        outputs_buf=None,
+        allgather_output=ag_out,
+        **extra_args,
+    )
+    # unpermute c1 into intermediate_cache1 for verification; c1: [M * topk, N]
+    for i in range(M):
+        indices = scatter_index[i]
+        intermediate_cache1[i] = c1[indices]
+    # intermediate2
+    torch.ops._C.silu_and_mul(intermediate_cache2,
+                                intermediate_cache1.view(-1, N))
+    # intermediate3 - token-centric
+    tmp_cache2 = intermediate_cache2.reshape(M, args.topk, N//2)
+    for i in range(M):
+        expert_ids = topk_ids[i]
+        for j in range(args.topk):
+            expert_weight = vllm_moe_layer.w2_weight[expert_ids[j]]
+            out = expert_weight @ tmp_cache2[i][j]
+            intermediate_cache3[i][j] = out
+
+    # FIXME: for topk=2,3,4, the vllm_op moe_sum != torch.sum ????? 
+    # topk_reduce = torch.empty((M, K), device=attn_out.device, dtype=attn_out.dtype)
+    # ops.moe_sum(intermediate_cache3,
+    #             topk_reduce)
+    topk_reduce = intermediate_cache3.sum(1)
+    print_rank0(f'intermediate_cache1: {intermediate_cache1.shape}, intermediate_cache2: {intermediate_cache2.shape}, intermediate_cache3: {intermediate_cache3.shape}, topk_reduce: {topk_reduce.shape}')
+
+    # AR
+    # token_centric_out = tensor_model_parallel_all_reduce(topk_reduce)
+
+    # RS+AG
+    # token_centric_out_rs = tensor_model_parallel_reduce_scatter(topk_reduce.float(),0)
+    # token_centric_out_rs = token_centric_out_rs.bfloat16()
+    token_centric_out_rs = tensor_model_parallel_reduce_scatter(topk_reduce,0)
+    token_centric_out = tensor_model_parallel_all_gather(token_centric_out_rs,0)
+
+    return rs_out, ag_out, token_centric_out, topk_weights, topk_ids.int(), \
+        intermediate_cache1, intermediate_cache2, intermediate_cache3, topk_reduce, token_centric_out_rs
+
+
+
+@torch.no_grad()
+def flux_forward(args,
+                o_proj, vllm_moe_layer: FusedMoE,
+                hidden_size_per_tp, router_logits,
+                q, k, v, out, 
+            ):
+    attn_out = out.view(-1, hidden_size_per_tp)
+
+    # PREP
+    M = attn_out.size(0) # in 
+    hidden_size = args.hidden_size # out
+    E, N, _K = vllm_moe_layer.w13_weight.shape
+    K = vllm_moe_layer.w2_weight.shape[1]
+    assert K == _K
+    tp_process_group = get_tp_group().device_group
+    is_fp8 = flux.util.is_fp8_dtype(attn_out.dtype)
+    is_s8_dequant = attn_out.dtype == torch.int8
+    output_dtype = torch.bfloat16 if is_fp8 or is_s8_dequant else attn_out.dtype
+    # print(f'rank {dist.get_rank()} attn_out: {attn_out.device}, o_proj.weight: {o_proj.weight.device}, {o_proj.weight.shape}, {M}, {output_dtype}')
+
+    # OUT_PROJECT
+    reduce_scatter_option = prepare_rs(args)
+    gemm_rs_op = flux.GemmRS(
+        tp_process_group,
+        1,  # NNODE
+        (M + 1024 - 1) // 1024 * 1024,
+        hidden_size,
+        attn_out.dtype,
+        output_dtype,
+        transpose_weight=args.transpose_weight,
+        fuse_reduction=args.fuse_reduction,
+        ring_reduction=args.ring_reduction,
+    )
+    rs_out = gemm_rs_op.forward(
+        attn_out,
+        o_proj.weight,
+        bias=None,
+        input_scale=None,
+        weight_scale=None,
+        output_scale=None,
+        fast_accum=False,
+        reduce_scatter_option=reduce_scatter_option,
+    )
+
+    # ROUTER
+    # TODO this can be skip; see the fused_topk, but use for convenience
+    proj_out = tensor_model_parallel_all_gather(rs_out,0)
+    # print_rank0(rs_out.shape,proj_out.shape, router_logits.shape)
+    topk_weights, topk_ids, token_expert_indices = fused_topk(
+        proj_out,
+        gating_output=router_logits,
+        topk=vllm_moe_layer.top_k,
+        renormalize=vllm_moe_layer.renormalize,
+        indices_type=torch.uint32,
+    )
+    choosed_experts, scatter_index, splits_gpu = prepare_scatter_index_split_gpu(topk_ids, E)
+
+    # MOE0
+    input_dtype = rs_out.dtype
+    output_dtype = torch.bfloat16 if is_fp8 else input_dtype
+    moe_args = flux.MoeArguments(
+        max_ntokens=args.batch_size * args.seq_len,
+        hidden=hidden_size,
+        ffn_hidden=args.intermediate_size * 2,  # FuseMoE's layer 0 doubles this, then act reduce by half
+        nexperts=E,
+        topk=args.topk,
+        input_dtype=input_dtype,
+        output_dtype=output_dtype,
+    )
+    extra_args = {}
+    global EP_GROUP
+    tp_env = flux.DistEnvTPWithEP(tp_group=tp_process_group, nnodes=1, ep_group=EP_GROUP)
+    ag_moe_op = flux.GemmGroupedV3AGScatter(tp_env=tp_env, moe_args=moe_args)
+    ag_moe_op.clear_buffers()
+    ag_out = torch.empty_like(proj_out)
     c1 = ag_moe_op.forward(
         inputs_shard=rs_out,
         weights=vllm_moe_layer.w13_weight,
@@ -825,15 +959,37 @@ def flux_forward(args,
         **extra_args,
     )
 
-    # unpermute c1
-    c1_unpermute = torch.zeros(M, args.topk, vllm_moe_layer.w13_weight.shape[1], dtype=clone.dtype, device=clone.device)
-    for i in range(M):
-        indices = scatter_index[i]
-        c1_unpermute[i] = c1[indices]
-        # print_rank0(c1_unpermute[i].shape, c1[indices].shape, indices)
+    c2 = torch.empty(size=(M*args.topk, N // 2), dtype=c1.dtype, device=c1.device)
+    torch.ops._C.silu_and_mul(c2, c1)
 
-    return rs_out, ag_out, None, topk_weights, topk_ids.int(), \
-        c1_unpermute, None, None
+    # MOE1
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    routing_idx = scatter_index.view(-1)
+    # FIXME: not support topk=8; try moe_layer1 first
+    flux_rs_op = flux.GemmGroupedV3GatherRS(E, 
+                                            M*args.topk, 
+                                            hidden_size, 
+                                            args.topk, 
+                                            rank,
+                                            world_size, 
+                                            args.tp_size, 
+                                            args.ep_size, 
+                                            1,
+                                        )
+    print_rank0(f'[Flux-MoE] c2: {c2.shape}, w2: {vllm_moe_layer.w2_weight.shape}, routing_idx: {routing_idx.shape}')
+    c3 = flux_rs_op.forward_gather_rs(
+        input=c2,
+        weight=vllm_moe_layer.w2_weight,
+        splits_cpu=splits_gpu.cpu(),
+        routing_idx=routing_idx,
+    )
+    # final - overlap with next layer
+    vllm_out = tensor_model_parallel_all_gather(c3,0)
+    print_rank0(f'[Flux-MoE] c3: {c3.shape}, vllm_out: {vllm_out.shape}')
+
+    return rs_out, ag_out, vllm_out, topk_weights, topk_ids.int(), \
+        None, None, None, None, c3
 
 
 def main():
@@ -1005,15 +1161,28 @@ def main():
     test_results(results)
     dist.barrier()
 
-    print_rank0('=='*10 + 'flux - gemmRS' + '=='*10)
+    print_rank0('=='*10 + 'gemmRS_moe - gemmRS_AGmoe' + '=='*10)
     results = {}
-    flux_outs = flux_forward(args,
+    gemmRS_AGmoe_outs = gemmRS_AGmoe_forward(args,
                  o_proj, vllm_moe_layer,
                  hidden_size_per_tp, router_logits,
                  q, k, v, out, 
                 )
-    names = ['rs_out','proj_out', 'moe_out', 'topk_w', 'topk_ids', 'c1', 'c2', 'c3']
-    for name, out1, out2 in zip(names, gemmRS_outs, flux_outs):
+    names = ['rs_out','proj_out', 'moe_out', 'topk_w', 'topk_ids', 'c1', 'c2', 'c3', 'partial_moe_out', 'RS-MOE']
+    for name, out1, out2 in zip(names, gemmRS_outs, gemmRS_AGmoe_outs):
+        test_tensors(out1, out2, name, results)
+    test_results(results)
+    dist.barrier()
+
+    print_rank0('=='*10 + 'flux - gemmRS_AGmoe' + '=='*10)
+    results = {}
+    flux_outs = flux_forward(args,
+                o_proj, vllm_moe_layer,
+                hidden_size_per_tp, router_logits,
+                q, k, v, out, 
+                )
+    names = ['rs_out','proj_out', 'moe_out', 'topk_w', 'topk_ids', 'c1', 'c2', 'c3', 'partial_moe_out', 'RS-MOE']
+    for name, out1, out2 in zip(names, flux_outs, gemmRS_AGmoe_outs):
         test_tensors(out1, out2, name, results)
     test_results(results)
     dist.barrier()
