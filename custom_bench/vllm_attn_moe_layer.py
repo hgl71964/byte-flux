@@ -966,7 +966,6 @@ def flux_forward(args,
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     routing_idx = scatter_index.view(-1)
-    # FIXME: not support topk=8; try moe_layer1 first
     flux_rs_op = flux.GemmGroupedV3GatherRS(E, 
                                             M*args.topk, 
                                             hidden_size, 
