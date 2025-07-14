@@ -354,7 +354,7 @@ def init_linear_weight(linear_layer):
             linear_layer.scheme.out_dtype = torch.bfloat16
 
 
-def test_allclose(tensor1, tensor2, threshold_map=None):
+def test_allclose(tensor1, tensor2, name, threshold_map=None):
     if threshold_map is None:
         threshold_map = {
             torch.float16: 1e-2,
@@ -366,7 +366,7 @@ def test_allclose(tensor1, tensor2, threshold_map=None):
     
     # Ensure tensors have same dtype
     if tensor1.dtype != tensor2.dtype:
-        raise ValueError(f"Tensor dtypes don't match: {tensor1.dtype} vs {tensor2.dtype}")
+        raise ValueError(f"{name} Tensor dtypes don't match: {tensor1.dtype} vs {tensor2.dtype}")
     
     # Get threshold for dtype, default to 1e-5 if not found
     threshold = threshold_map.get(tensor1.dtype, 1e-5)
@@ -400,7 +400,7 @@ def test_allclose(tensor1, tensor2, threshold_map=None):
 def test_tensors(ref_out, test_out, name, results):
     if ref_out is not None and test_out is not None:
         results[name] = test_allclose(
-            ref_out, test_out,
+            ref_out, test_out, name,
         )
 
 def test_results(results):
@@ -597,9 +597,7 @@ def _bf16_moe(
                                 sorted_token_ids,
                                 expert_ids,
                                 num_tokens_post_padded,
-                                # FIXME flux does not support in-kernel accumuldation yet
-                                # default: not apply_router_weight_on_input, -> True
-                                apply_router_weight_on_input,
+                                not apply_router_weight_on_input,
                                 1,
                                 config,
                                 compute_type=compute_type,
@@ -612,6 +610,46 @@ def _bf16_moe(
 
         ops.moe_sum(intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx])
+        
+        ## XXX accumulate outside the kernel
+        ## the weighted match - but sum does not match...
+        # cache3 = torch.empty_like(intermediate_cache3)
+        # invoke_fused_moe_kernel(qintermediate_cache2,
+        #                         w2,
+        #                         cache3,
+        #                         a2q_scale,
+        #                         None,
+        #                         None,
+        #                         curr_topk_weights,
+        #                         sorted_token_ids,
+        #                         expert_ids,
+        #                         num_tokens_post_padded,
+        #                         apply_router_weight_on_input,
+        #                         1,
+        #                         config,
+        #                         compute_type=compute_type,
+        #                         use_fp8_w8a8=False,
+        #                         use_int8_w8a8=False,
+        #                         use_int8_w8a16=False,
+        #                         use_int4_w4a16=False,
+        #                         per_channel_quant=False,
+        #                         block_shape=None)
+        # # weighted_cache3 = torch.zeros((M, 8, K), device=cache3.device, dtype=cache3.dtype)
+        # # for i in range(M):
+        # #     for j in range(8): # topk
+        # #         weighted_cache3[i][j] = cache3[i][j] * topk_weights[i][j]
+        # weighted_cache3 = cache3 * topk_weights.view(M, -1, 1).to(cache3.dtype)
+        
+        # # out = weighted_cache3.sum(1)
+        # out = torch.empty((M, K), device=out_hidden_states.device, dtype=out_hidden_states.dtype)
+        # ops.moe_sum(weighted_cache3.view(*weighted_cache3.shape),
+        #             out)
+        # # print_rank0(f'topk_weights={topk_weights.shape}, weighted_cache3={weighted_cache3.shape}, out={out.shape}, intermediate_cache3={intermediate_cache3.shape}, out_hidden_states={out_hidden_states.shape}')
+        # r={}
+        # test_tensors(weighted_cache3, intermediate_cache3, 'cache3', r)
+        # test_tensors(out, out_hidden_states, 'out', r)
+        # test_results(r)
+        # raise
 
     assert chunk == 0, 'we only want 1 step now'
     return intermediate_cache1, intermediate_cache2, intermediate_cache3, out_hidden_states
@@ -850,24 +888,31 @@ def gemmRS_AGmoe_forward(args,
             out = expert_weight @ tmp_cache2[i][j]
             intermediate_cache3[i][j] = out
 
+    # ACCU expert results
+
+    ## just sum
     # FIXME: for topk=2,3,4, the vllm_op moe_sum != torch.sum ????? 
-    # topk_reduce = torch.empty((M, K), device=attn_out.device, dtype=attn_out.dtype)
+    # vllm_partial_out = torch.empty((M, K), device=attn_out.device, dtype=attn_out.dtype)
     # ops.moe_sum(intermediate_cache3,
-    #             topk_reduce)
-    topk_reduce = intermediate_cache3.sum(1)
-    print_rank0(f'intermediate_cache1: {intermediate_cache1.shape}, intermediate_cache2: {intermediate_cache2.shape}, intermediate_cache3: {intermediate_cache3.shape}, topk_reduce: {topk_reduce.shape}')
+    #             vllm_partial_out)
+    # vllm_partial_out = intermediate_cache3.sum(1)
+
+    ## apply_router_weight_on_input, XXX triton's kernel seems to lose some precision, see vllm's test_moe
+    intermediate_cache3 = intermediate_cache3 * topk_weights.view(M, -1, 1).to(intermediate_cache3.dtype)
+    vllm_partial_out = intermediate_cache3.sum(1)
+    print_rank0(f'intermediate_cache1: {intermediate_cache1.shape}, intermediate_cache2: {intermediate_cache2.shape}, intermediate_cache3: {intermediate_cache3.shape}, vllm_partial_out: {vllm_partial_out.shape}')
 
     # AR
-    # token_centric_out = tensor_model_parallel_all_reduce(topk_reduce)
+    # token_centric_out = tensor_model_parallel_all_reduce(vllm_partial_out)
 
     # RS+AG
-    # token_centric_out_rs = tensor_model_parallel_reduce_scatter(topk_reduce.float(),0)
+    # token_centric_out_rs = tensor_model_parallel_reduce_scatter(vllm_partial_out.float(),0)
     # token_centric_out_rs = token_centric_out_rs.bfloat16()
-    token_centric_out_rs = tensor_model_parallel_reduce_scatter(topk_reduce,0)
+    token_centric_out_rs = tensor_model_parallel_reduce_scatter(vllm_partial_out,0)
     token_centric_out = tensor_model_parallel_all_gather(token_centric_out_rs,0)
 
     return rs_out, ag_out, token_centric_out, topk_weights, topk_ids.int(), \
-        intermediate_cache1, intermediate_cache2, intermediate_cache3, topk_reduce, token_centric_out_rs
+        intermediate_cache1, intermediate_cache2, intermediate_cache3, vllm_partial_out, token_centric_out_rs
 
 
 

@@ -67,7 +67,7 @@ def perf_torch(
     split_cpu: torch.Tensor,
     iters: int,
     warmup_iters: int,
-    token_index: torch.Tensor,
+    gather_index: torch.Tensor,
     topk_index: torch.Tensor,
     topk: int,
     input_scales: Union[torch.Tensor, List[torch.Tensor], None],
@@ -89,7 +89,7 @@ def perf_torch(
             inputs,
             weights,
             split_cpu,
-            token_index,
+            gather_index,
             topk_index,
             topk,
             input_scales,
@@ -189,8 +189,9 @@ def test_torch(
     split_cpu: torch.Tensor,
     iters: int,
     warmup_iters: int,
-    token_index: torch.Tensor,
+    gather_index: torch.Tensor,
     topk_index: torch.Tensor,
+    routing_idx: torch.Tensor,
     topk: int,
     input_scales: Union[torch.Tensor, List[torch.Tensor], None],
     weight_scales: Union[torch.Tensor, List[torch.Tensor], None],
@@ -206,7 +207,7 @@ def test_torch(
         inputs,
         weights,
         split_cpu,
-        token_index,
+        gather_index,
         topk_index,
         topk,
         input_scales,
@@ -227,11 +228,17 @@ def test_torch(
     if rank == 1:
         print('*'*50)
         print(f'rank: {rank}, m_max: {m_max}, eid_start: {eid_start}, ep_rank_m_start: {ep_rank_m_start}, ep_rank_m_end: {ep_rank_m_end}')
-        # print(topk_index.shape, token_index.shape)
+        print(f'topk_index.shape: {topk_index.shape}, gather_index.shape: {gather_index.shape}, routing_idx.shape: {routing_idx.shape}')
         # print(topk_index)
         # print(topk_index.max())
-        # print(token_index)
-        # print(token_index.max())
+        print('gather_index: ')
+        print(gather_index)
+        print(gather_index.max())
+        print('scatter_index: ')
+        print(routing_idx)
+        print(routing_idx.max())
+        print('*'*50)
+
     TP_GROUP.barrier()
     ## 2, expert centric
     acc = 0
@@ -243,7 +250,7 @@ def test_torch(
         acc += Mi
     ## 3, unpermute back to original order
     for i in range(M):
-        mask = token_index == i
+        mask = gather_index == i
         select = expert_output[mask]
         expert_unpermuted[i] = select
     topk_reduce = expert_unpermuted.sum(1)
@@ -359,7 +366,7 @@ if __name__ == "__main__":
     ori_token_num = args.M // args.topk
     generator = torch.Generator("cuda")
     generator.manual_seed(12345)
-    random_seq_len, random_gate, token_index, topk_index, routing_idx = gate_func(
+    random_seq_len, random_gate, gather_index, topk_index, routing_idx = gate_func(
         ori_token_num, args.G, args.topk, args.dist, generator
     )
 
@@ -440,7 +447,7 @@ if __name__ == "__main__":
         output_vec_scales = None
 
     # print("split_cpu:", random_seq_len)
-    # _print_tensor_desc("token_index", token_index)
+    # _print_tensor_desc("gather_index", gather_index)
     # _print_tensor_desc("topk_index", topk_index)
     # _print_tensor_desc("weight_scale", weight_scales)
     # _print_tensor_desc("input_scale", input_scales)
@@ -449,10 +456,10 @@ if __name__ == "__main__":
 
     if TP_GROUP.rank() == 0:
         print(f'*'*20)
-        print(f'inputs={inputs.shape} weights={weights.shape} split_cpu={split_cpu.shape} ({split_cpu.sum()}) token_index={token_index.shape} topk_index={topk_index.shape} routing_idx={routing_idx.shape}')
-        # print(token_index)
+        print(f'inputs={inputs.shape} weights={weights.shape} split_cpu={split_cpu.shape} ({split_cpu.sum()}) gather_index={gather_index.shape} topk_index={topk_index.shape} routing_idx={routing_idx.shape}')
+        # print(gather_index)
         # print(topk_index)
-        print(routing_idx)
+        # print(routing_idx)
         # print(f'input_scales={input_scales} weight_scales={weight_scales} output_vec_scales={output_vec_scales}')
         print(f'*'*20)
     TP_GROUP.barrier()
@@ -485,7 +492,7 @@ if __name__ == "__main__":
             split_cpu,
             args.iters,
             args.warmup_iters,
-            token_index,
+            gather_index,
             topk_index,
             args.topk,
             input_scales,
@@ -542,8 +549,9 @@ if __name__ == "__main__":
         split_cpu,
         args.iters,
         args.warmup_iters,
-        token_index,
+        gather_index,
         topk_index,
+        routing_idx,
         args.topk,
         input_scales,
         weight_scales,
