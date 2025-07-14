@@ -67,15 +67,14 @@ pip3 install packaging ninja cmake wheel
 chmod +x install_deps.sh
 ./install_deps.sh
 
-
-# then just include the cuda/atomic
-
 export PYTHONPATH=$(pwd)/python
-# export PYTHONPATH=/workspace/byte-flux/python:/workspace/vllm-cohere-flux/
 
 ./build.sh --clean-all
 # ./build.sh --arch "80;89;90" --nvshmem --package
 ./build.sh --arch "90" --nvshmem --package
+
+# find all gen op
+find build -name "gen*"
 ```
 
 Then you would expect a wheel package under `dist/` folder that is suitable for your virtual environment.
