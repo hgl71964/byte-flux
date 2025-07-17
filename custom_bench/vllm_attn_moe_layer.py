@@ -1008,6 +1008,7 @@ def flux_forward(args,
     torch.ops._C.silu_and_mul(c2, c1)
 
     # MOE1
+    # FIXME MoEES cannot apply topk weight inside
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     routing_idx = scatter_index.view(-1)

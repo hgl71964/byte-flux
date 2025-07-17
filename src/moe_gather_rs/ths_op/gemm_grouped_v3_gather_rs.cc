@@ -706,6 +706,18 @@ class GemmGroupedV3GatherRS::GemmGroupedV3GatherRSOpImpl {
     nvshmemx_barrier_all_on_stream(stream);
     this->barrier.zero_();
     if (this->ep_world_size == 1) {
+
+      //auto sliced = this->output_buffer.slice(0, 0, M / this->topk);
+      //std::cout << "After slice: " << sliced.sizes() << std::endl;
+
+      //auto reshaped = sliced.view({this->world_size, M / this->world_size / this->topk, N});
+      //std::cout << "After view: " << reshaped.sizes() << std::endl;
+
+      //auto reduced = reshaped.sum(torch::IntArrayRef({0}));
+      //std::cout << "After sum: " << reduced.sizes() << std::endl;
+
+      //return reduced;
+
       return this->output_buffer.slice(0, 0, M / this->topk)
           .view({this->world_size, M / this->world_size / this->topk, N})
           .sum(torch::IntArrayRef({0}));

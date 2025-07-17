@@ -6,7 +6,12 @@
                 "${workspaceFolder}/src/**",
                 "${workspaceFolder}/include/**"
             ],
-            "defines": [],
+            "defines": [
+                "__CUDACC__",  // Indicates CUDA compilation
+                "__CUDA_ARCH__=900",  // H100 is SM_90 (90 * 10 = 900)
+                "__CUDA_ARCH_FEAT_SM90_ALL__=1",  // Enable all features of SM90
+                "__CUDA_ARCH_FEAT_SM90_ALL=1"
+            ],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c17",
             "cppStandard": "gnu++17",
