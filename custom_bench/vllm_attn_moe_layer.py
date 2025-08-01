@@ -436,7 +436,6 @@ def vllm_forward(args,
 
     proj_out, _ = o_proj(attn_out)  # applied all-reduce
     # print_rank0(f'proj_out: {proj_out.shape}, router_logits: {router_logits.shape}')
-    # print_rank0(f'{o_proj.weight}, {attn_out}, {proj_out}')
 
     vllm_out = vllm_moe_layer(proj_out.clone(), router_logits) # NOTE: inplace
     # print_rank0(f'vllm_out: {vllm_out.shape}')
@@ -463,7 +462,7 @@ def breakdown_forward(args,
     ## RS+AG
     rs_out = tensor_model_parallel_reduce_scatter(partial_out,0)
     proj_out = tensor_model_parallel_all_gather(rs_out,0)
-    # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
+    print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape},')
 
     ## RS+AG (high precision)
     # rs_out = tensor_model_parallel_reduce_scatter(partial_out.float(),0)
@@ -483,7 +482,7 @@ def breakdown_forward(args,
     # print_rank0(f'partial_out: {partial_out.shape}, rs_out: {rs_out.shape}, proj_out: {proj_out.shape}')
 
     vllm_out = vllm_moe_layer(proj_out.clone(), router_logits)
-    # print_rank0(f'vllm_out: {vllm_out.shape}')
+    print_rank0(f'vllm_out: {vllm_out.shape}')
     return rs_out, proj_out, vllm_out
 
 
@@ -1151,7 +1150,7 @@ def main():
     ).to(device)
     init_linear_weight(o_proj)
     print_rank0(f'[Linear] {o_proj.weight.shape}, {o_proj.weight.dtype}')
-    print_rank0(f'[MoE] {vllm_moe_layer.w13_weight.shape} {vllm_moe_layer.w13_weight.dtype}')
+    print_rank0(f'[MoE] {vllm_moe_layer.w13_weight.shape} {vllm_moe_layer.w13_weight.dtype}, {vllm_moe_layer.w2_weight.shape} {vllm_moe_layer.w2_weight.dtype}')
     # print_rank0(f'{o_proj.scheme.out_dtype}, {o_proj.scheme}')
     dist.barrier()
 

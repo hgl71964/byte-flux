@@ -75,6 +75,10 @@ export PYTHONPATH=$(pwd)/python
 
 # find all gen op
 find build -name "gen*"
+
+
+# if see ValueError: Specified device cuda:1 does not match device of data cuda:0 when init Op (e.g. GemmRS)
+# export NVSHMEM_DISABLE_CUDA_VMM=1
 ```
 
 Then you would expect a wheel package under `dist/` folder that is suitable for your virtual environment.

@@ -131,6 +131,9 @@ def get_sizes(args):
     """Defines the tensor sizes (in bytes) to test."""
     sizes = [
         #1024,  # 1 KB
+        64 * 1024,  # 64 KB
+        128 * 1024,  # 128 KB
+        512 * 1024,  # 512 KB
         1024 * 1024,  # 1 MB
         8 * 1024 * 1024,  # 8 MB
         64 * 1024 * 1024,  # 64 MB
