@@ -7,6 +7,8 @@ import argparse
 from datetime import timedelta
 from functools import partial
 
+# to run C++: https://github.com/nvidia/nccl-tests/issues/333
+
 # Example torchrun commands:
 # Single Op (e.g., all-gather on 2 nodes, 8 GPUs each):
 # Node 0:
